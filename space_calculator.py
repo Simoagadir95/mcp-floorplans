@@ -5,8 +5,9 @@ No API calls - pure computational logic.
 """
 
 import json
+import math
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from enum import Enum
 
 
@@ -45,6 +46,11 @@ class Zone:
     occupancy: int  # people at max capacity
     adjacencies: List[str]  # zone names it should be near
     notes: str
+    # Geometric coordinates (added by squarified treemap)
+    x: Optional[float] = None  # meters from origin
+    y: Optional[float] = None  # meters from origin
+    width: Optional[float] = None  # meters
+    length: Optional[float] = None  # meters
 
 
 @dataclass
@@ -93,6 +99,157 @@ class SpaceCalculator:
         self.zone_types = [ZoneType(zt) if isinstance(zt, str) else zt for zt in zone_types]
         self.collaboration_style = collaboration_style
         self.circulation_pct = 0.15  # 15% for corridors, stairs, etc.
+        self.circulation_tolerance = 0.02  # ±2% surface conservation tolerance
+
+    def _squarify_treemap(self, areas: List[Tuple[str, float]],
+                          x: float, y: float, width: float, height: float,
+                          rectangles: Dict[str, Tuple[float, float, float, float]],
+                          row: List[Tuple[str, float]]) -> None:
+        """
+        Squarified treemap subdivision (Marson & Musse 2010).
+        Recursively subdivides rectangular space into sub-rectangles.
+
+        Args:
+            areas: List of (zone_name, area_sqm) tuples sorted descending
+            x, y: Origin coordinates (meters)
+            width, height: Dimensions (meters)
+            rectangles: Output dict mapping zone_name -> (x, y, width, height)
+            row: Current row being processed
+        """
+        if not areas:
+            return
+
+        if len(areas) == 0:
+            return
+
+        # Base case: single rectangle
+        if len(areas) == 1:
+            name, area = areas[0]
+            rectangles[name] = (x, y, width, height)
+            return
+
+        # Calculate total area of current row
+        row_area = sum(a[1] for a in row) if row else 0
+
+        # Try adding next area to row
+        if not row:
+            # Start new row with first area
+            self._squarify_treemap(areas[1:], x, y, width, height,
+                                  rectangles, [areas[0]])
+        else:
+            # Calculate worst aspect ratio if we add next area to row
+            next_area = areas[0]
+            total_area = row_area + next_area[1]
+
+            # Decide whether to add to row or start new row
+            # Use aspect ratio as metric (prefer squares)
+            if len(row) == 1:
+                # First in row: add next
+                self._squarify_treemap(areas[1:], x, y, width, height,
+                                      rectangles, row + [next_area])
+            else:
+                # Check if adding next would worsen aspect ratio
+                current_worst = self._worst_aspect_ratio(row, width, height, row_area)
+                new_worst = self._worst_aspect_ratio(row + [next_area], width, height, total_area)
+
+                if new_worst <= current_worst:
+                    # Continue row
+                    self._squarify_treemap(areas[1:], x, y, width, height,
+                                          rectangles, row + [next_area])
+                else:
+                    # Layout current row, start new one
+                    new_x, new_y, new_width, new_height = self._layout_row(
+                        row, x, y, width, height, row_area, rectangles
+                    )
+                    self._squarify_treemap(areas, new_x, new_y, new_width, new_height,
+                                          rectangles, [])
+
+    def _worst_aspect_ratio(self, items: List[Tuple[str, float]],
+                           width: float, height: float, total_area: float) -> float:
+        """Calculate worst aspect ratio in a potential layout."""
+        if total_area == 0 or width == 0 or height == 0:
+            return float('inf')
+
+        short_side = min(width, height)
+        long_side = max(width, height)
+
+        worst = 0.0
+        for name, area in items:
+            # Aspect ratio of this element if laid in row
+            ratio = (long_side * long_side * total_area) / (area * area * short_side * short_side)
+            worst = max(worst, ratio)
+
+        return worst
+
+    def _layout_row(self, items: List[Tuple[str, float]],
+                   x: float, y: float, width: float, height: float,
+                   total_area: float,
+                   rectangles: Dict[str, Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
+        """Layout a row of rectangles and return remaining space."""
+        if not items or total_area == 0:
+            return x, y, width, height
+
+        # Determine row direction (horizontal or vertical)
+        if width >= height:
+            # Horizontal row
+            row_width = width
+            row_height = total_area / row_width if row_width > 0 else 0
+
+            # Place each item in row
+            current_x = x
+            for name, area in items:
+                item_width = area / row_height if row_height > 0 else 0
+                rectangles[name] = (current_x, y, item_width, row_height)
+                current_x += item_width
+
+            # Return remaining space below row
+            return x, y + row_height, width, height - row_height
+        else:
+            # Vertical row
+            row_height = height
+            row_width = total_area / row_height if row_height > 0 else 0
+
+            # Place each item in column
+            current_y = y
+            for name, area in items:
+                item_height = area / row_width if row_width > 0 else 0
+                rectangles[name] = (x, current_y, row_width, item_height)
+                current_y += item_height
+
+            # Return remaining space to right
+            return x + row_width, y, width - row_width, height
+
+    def _apply_geometric_layout(self, zones: List[Zone]) -> List[Zone]:
+        """
+        Apply squarified treemap layout to zones.
+        Adds x, y, width, length coordinates to each zone.
+        """
+        if not zones:
+            return zones
+
+        # Set up coordinate system: assume rectangular envelope
+        # Aspect ratio 1:1 for simplicity (can be parameterized)
+        side_length = math.sqrt(self.surface_sqm)
+
+        # Apply treemap to ALL zones (including circulation)
+        areas = [(z.name, z.sqm) for z in zones]
+        areas.sort(key=lambda x: -x[1])  # Sort descending by area
+
+        rectangles: Dict[str, Tuple[float, float, float, float]] = {}
+
+        # Start squarification from top-left
+        self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [])
+
+        # Assign coordinates to zones
+        for zone in zones:
+            if zone.name in rectangles:
+                x, y, w, h = rectangles[zone.name]
+                zone.x = x
+                zone.y = y
+                zone.width = w
+                zone.length = h
+
+        return zones
 
     def calculate_usable_area(self) -> float:
         """Calculate usable area after accounting for circulation."""
@@ -135,10 +292,18 @@ class SpaceCalculator:
         return distribution
 
     def _create_zones(self, distribution: Dict[ZoneType, int]) -> List[Zone]:
-        """Create zone objects from distribution."""
-        usable = self.calculate_usable_area()
+        """
+        Create zone objects from distribution.
+        Allocates 85% of surface to usable zones, 15% to circulation.
+        """
+        usable = self.calculate_usable_area()  # 85% of total surface
+        circulation_sqm = self.surface_sqm * self.circulation_pct  # 15% of total
         zones = []
         zone_counter = {}
+
+        # Calculate total sqm needed for all zones
+        total_calculated = 0
+        zone_allocations = {}
 
         for zone_type, count in distribution.items():
             if count == 0:
@@ -147,57 +312,97 @@ class SpaceCalculator:
             sqm_per_person = self.ZONE_SIZING.get(zone_type, 4.0)
 
             if zone_type == ZoneType.STORAGE:
-                # Storage gets 5% of usable area as fixed allocation
+                # Storage gets 5% of usable area
+                zone_allocations[zone_type] = usable * 0.05
+            else:
+                zone_allocations[zone_type] = count * sqm_per_person
+                total_calculated += zone_allocations[zone_type]
+
+        # Normalize allocations to fit usable area (85% of total)
+        # Scale all zones proportionally to fit exactly in usable area
+        if total_calculated > 0 and total_calculated != usable:
+            scale_factor = usable / total_calculated
+            for zone_type in zone_allocations:
+                if zone_type != ZoneType.STORAGE:
+                    zone_allocations[zone_type] *= scale_factor
+
+        # Create zone objects
+        for zone_type, count in distribution.items():
+            if count == 0:
+                continue
+
+            allocated_sqm = zone_allocations.get(zone_type, 0)
+
+            if zone_type == ZoneType.STORAGE:
                 zone = Zone(
                     zone_type=zone_type.value,
                     name="Storage / Archive",
-                    sqm=usable * 0.05,
+                    sqm=allocated_sqm,
                     occupancy=0,
                     adjacencies=["circulation"],
                     notes="Filing, archive, supplies storage"
                 )
                 zones.append(zone)
-            else:
-                # Calculate sqm for this zone type
-                zone_sqm = count * sqm_per_person
-
-                # For meeting rooms, assume 4-6 people per room
-                if zone_type == ZoneType.MEETING:
-                    num_rooms = max(1, count // 4)
-                    room_sqm = zone_sqm / num_rooms
-                    for i in range(num_rooms):
-                        zone = Zone(
-                            zone_type=zone_type.value,
-                            name=f"Meeting Room {i+1}",
-                            sqm=room_sqm,
-                            occupancy=4,
-                            adjacencies=["open-space", "circulation"],
-                            notes="Video conferencing equipped"
-                        )
-                        zones.append(zone)
-                elif zone_type == ZoneType.PHONE_BOOTH:
-                    # Each booth: 1 person
-                    for i in range(count):
-                        zone = Zone(
-                            zone_type=zone_type.value,
-                            name=f"Phone Booth {i+1}",
-                            sqm=2.0,  # Standard 2 sqm booth
-                            occupancy=1,
-                            adjacencies=["open-space"],
-                            notes="Acoustic isolation for calls"
-                        )
-                        zones.append(zone)
-                else:
-                    # Open space, quiet zones, break rooms as single zones
+            elif zone_type == ZoneType.MEETING:
+                # Subdivide meeting space into rooms (4-6 people each)
+                num_rooms = max(1, count // 4)
+                room_sqm = allocated_sqm / num_rooms
+                for i in range(num_rooms):
                     zone = Zone(
                         zone_type=zone_type.value,
-                        name=zone_type.value.replace("-", " ").title(),
-                        sqm=zone_sqm,
-                        occupancy=count,
-                        adjacencies=self._get_adjacencies(zone_type),
-                        notes=self._get_zone_notes(zone_type)
+                        name=f"Meeting Room {i+1}",
+                        sqm=room_sqm,
+                        occupancy=4,
+                        adjacencies=["open-space", "circulation"],
+                        notes="Video conferencing equipped"
                     )
                     zones.append(zone)
+            elif zone_type == ZoneType.PHONE_BOOTH:
+                # Each booth: 1 person, 2 sqm
+                num_booths = count
+                booth_sqm = allocated_sqm / num_booths if num_booths > 0 else 2.0
+                for i in range(num_booths):
+                    zone = Zone(
+                        zone_type=zone_type.value,
+                        name=f"Phone Booth {i+1}",
+                        sqm=booth_sqm,
+                        occupancy=1,
+                        adjacencies=["open-space"],
+                        notes="Acoustic isolation for calls"
+                    )
+                    zones.append(zone)
+            else:
+                # Open space, quiet zones, break rooms
+                zone = Zone(
+                    zone_type=zone_type.value,
+                    name=zone_type.value.replace("-", " ").title(),
+                    sqm=allocated_sqm,
+                    occupancy=count,
+                    adjacencies=self._get_adjacencies(zone_type),
+                    notes=self._get_zone_notes(zone_type)
+                )
+                zones.append(zone)
+
+        # Add circulation zone
+        zones.append(Zone(
+            zone_type=ZoneType.CIRCULATION.value,
+            name="Circulation & Common",
+            sqm=circulation_sqm,
+            occupancy=0,
+            adjacencies=[],
+            notes="Corridors, stairs, lobbies, restrooms"
+        ))
+
+        # Reconcile workstations with headcount
+        # Ensure enough workstations for headcount
+        open_space_zones = [z for z in zones if z.zone_type == "open-space"]
+        if open_space_zones:
+            total_open_occupancy = sum(z.occupancy for z in open_space_zones)
+            if total_open_occupancy < self.headcount:
+                # Scale up occupancy proportionally
+                scale = self.headcount / total_open_occupancy if total_open_occupancy > 0 else 1
+                for z in open_space_zones:
+                    z.occupancy = max(1, int(z.occupancy * scale))
 
         return zones
 
@@ -224,6 +429,55 @@ class SpaceCalculator:
             ZoneType.STORAGE: "Filing, equipment, and supplies storage",
         }
         return notes.get(zone_type, "")
+
+    def _calculate_window_distance(self, zones: List[Zone]) -> Tuple[float, float]:
+        """
+        Calculate average distance to perimeter and percentage with good light.
+        Based on actual geometric coordinates.
+        """
+        if not zones:
+            return 0.0, 0.0
+
+        # Find envelope bounds
+        min_x = min((z.x for z in zones if z.x is not None), default=0)
+        min_y = min((z.y for z in zones if z.y is not None), default=0)
+        max_x = max((z.x + z.width for z in zones if z.x is not None and z.width is not None), default=0)
+        max_y = max((z.y + z.length for z in zones if z.y is not None and z.length is not None), default=0)
+
+        width = max_x - min_x if max_x > min_x else 1
+        height = max_y - min_y if max_y > min_y else 1
+
+        # Calculate average distance and light percentage
+        total_distance = 0.0
+        light_area = 0.0
+        total_area = 0.0
+
+        for z in zones:
+            if z.x is not None and z.y is not None and z.width is not None and z.length is not None:
+                # Center of zone
+                cx = z.x + z.width / 2
+                cy = z.y + z.length / 2
+
+                # Distance to nearest perimeter
+                dist_to_perimeter = min(
+                    cx - min_x,
+                    max_x - cx,
+                    cy - min_y,
+                    max_y - cy
+                )
+
+                # Zones close to perimeter (< 5m or < 30% of width) have good light
+                has_good_light = dist_to_perimeter < 5 or dist_to_perimeter < width * 0.3
+
+                total_distance += dist_to_perimeter * z.sqm
+                if has_good_light and z.zone_type != "circulation":
+                    light_area += z.sqm
+                total_area += z.sqm
+
+        avg_distance = total_distance / total_area if total_area > 0 else 0
+        natural_light_pct = (light_area / total_area * 100) if total_area > 0 else 0
+
+        return avg_distance, natural_light_pct
 
     def calculate_metrics(self, zones: List[Zone]) -> SpaceMetrics:
         """Calculate metrics from zone layout."""
@@ -255,15 +509,8 @@ class SpaceCalculator:
         # Average sqm per person
         avg_per_person = self.surface_sqm / self.headcount if self.headcount > 0 else 0
 
-        # Window distance (average): assume windows on perimeter, center is farthest
-        # For rectangular space, max distance ~ sqrt((surface/aspect)^2 + (surface*aspect)^2) / 2
-        # Approximate: max_distance = sqrt(surface) / 2, avg = sqrt(surface) / 4
-        import math
-        max_distance = math.sqrt(self.surface_sqm) / 2
-        avg_window_distance = max_distance / 2
-
-        # Natural light zones: assume 30-50% of space can have window access
-        natural_light_pct = min(50, max(30, self.surface_sqm / self.headcount / 2))
+        # Window distance and natural light from actual geometry
+        avg_window_distance, natural_light_pct = self._calculate_window_distance(zones)
 
         return SpaceMetrics(
             total_sqm=self.surface_sqm,
@@ -283,6 +530,8 @@ class SpaceCalculator:
         variants = []
         distribution = self._distribute_zones()
         base_zones = self._create_zones(distribution)
+        # Apply geometric layout (treemap)
+        base_zones = self._apply_geometric_layout(base_zones)
         metrics = self.calculate_metrics(base_zones)
 
         # Variant 1: Balanced (base)
@@ -305,6 +554,7 @@ class SpaceCalculator:
             )
             collab_dist = collab_calc._distribute_zones()
             collab_zones = collab_calc._create_zones(collab_dist)
+            collab_zones = collab_calc._apply_geometric_layout(collab_zones)
             collab_metrics = collab_calc.calculate_metrics(collab_zones)
 
             variant_2 = LayoutVariant(
@@ -326,6 +576,7 @@ class SpaceCalculator:
             )
             focus_dist = focus_calc._distribute_zones()
             focus_zones = focus_calc._create_zones(focus_dist)
+            focus_zones = focus_calc._apply_geometric_layout(focus_zones)
             focus_metrics = focus_calc.calculate_metrics(focus_zones)
 
             variant_3 = LayoutVariant(
