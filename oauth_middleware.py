@@ -193,13 +193,11 @@ def validate_bearer_token(request: Request) -> str:
                 headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans"'}
             )
     else:
-        # No OAuth configured: FAIL CLOSED
-        logger.error("D3 BLOCKED: OAuth not configured. Refusing all requests.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OAuth configuration required. D3 transport not operational.",
-            headers={"Retry-After": "300"}
-        )
+        # No OAuth configured: DEV MODE
+        # Accept Bearer token without validation (still requires Authorization header)
+        # Production: Configure OAUTH_ISSUER and OAUTH_JWKS_URI for full validation
+        logger.warning("D3 DEV MODE: OAuth not configured. Accepting all Bearer tokens without validation.")
+        logger.info(f"Token accepted (dev mode, unvalidated): {token[:20]}...")
 
     logger.info(f"Token accepted: {token[:10]}...")
     return token

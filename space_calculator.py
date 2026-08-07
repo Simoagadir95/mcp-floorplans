@@ -419,17 +419,12 @@ class SpaceCalculator:
         self._verify_no_overlaps(zones)
 
         # ENFORCE: No zones should violate constraints in final output
-        # This is now a hard error, not a soft warning
+        # This is a hard error, not a soft warning
         if constraint_violations:
-            # Log violation details for debugging
-            logger.error(f"Layout has {len(constraint_violations)} constraint violations: {constraint_violations}")
-            # For now, we log the error but proceed (in production, may need re-layout)
-            # In future cycles: implement constraint-aware re-subdivision or zone merging
-            # To ensure compliance, circulation zone notes track violations for auditing
-            circ_zones = [z for z in zones if z.zone_type == "circulation"]
-            if circ_zones:
-                violations_text = "; ".join(constraint_violations)
-                circ_zones[0].notes += f" [SHAPE CONSTRAINT VIOLATIONS DETECTED: {violations_text}]"
+            # Constraint violations are not acceptable; raise error instead of proceeding
+            violation_details = "; ".join(constraint_violations)
+            logger.error(f"Layout generation failed: {len(constraint_violations)} constraint violations: {violation_details}")
+            raise ValueError(f"Cannot generate layout due to constraint violations: {violation_details}")
 
         return zones, constraint_violations
 
