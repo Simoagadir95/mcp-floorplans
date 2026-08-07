@@ -431,19 +431,23 @@ class SpaceCalculator:
                     zone.y = y
                     zone.width = w
                     zone.length = h
-                    # CRITICAL FIX: Recalculate sqm from final geometry to ensure consistency
-                    # This guarantees that sqm == width * length always
-                    zone.sqm = w * h
 
-            # Normalize sqm values to match total surface (preserves proportions)
-            # This ensures sum(sqm) == surface_sqm after geometry layout
-            total_zone_sqm = sum(z.sqm for z in working_zones)
-            if total_zone_sqm > 0:
-                normalize_factor = self.surface_sqm / total_zone_sqm
+            # CRITICAL FIX FOR DEFECT 2: Ensure sqm == width * length invariant
+            # The treemap creates rectangles but may not preserve the scaled sqm values due to discretization
+            # Solution: Calculate each zone's actual area from geometry, then normalize all to maintain total
+            actual_areas = [z.width * z.length for z in working_zones]
+            total_actual = sum(actual_areas)
+
+            if total_actual > 0:
+                # Scale all geometry proportionally so that sum of (width * length) == surface_sqm
+                scale_factor = math.sqrt(self.surface_sqm / total_actual)
                 for zone in working_zones:
-                    zone.sqm *= normalize_factor
+                    zone.width *= scale_factor
+                    zone.length *= scale_factor
+                    # Now sqm EXACTLY matches width * length
+                    zone.sqm = zone.width * zone.length
 
-            # NOW check shape constraints on final, normalized geometry
+            # NOW check shape constraints on final geometry
             for zone in working_zones:
                 if zone.width is not None and zone.length is not None:
                     # Check shape constraints
@@ -470,12 +474,13 @@ class SpaceCalculator:
 
             # If no constraint violations, success!
             if not constraint_violations:
-                # Copy back to original zones list
+                # Copy back to original zones list (including sqm which was just recalculated)
                 for i, zone in enumerate(zones):
                     zone.x = working_zones[i].x
                     zone.y = working_zones[i].y
                     zone.width = working_zones[i].width
                     zone.length = working_zones[i].length
+                    zone.sqm = working_zones[i].sqm  # CRITICAL: also copy the recalculated sqm
                 logger.info(f"Layout converged at attempt {attempt+1}")
                 return zones, []
 
@@ -537,6 +542,7 @@ class SpaceCalculator:
                     zone.y = best_layout_zones[i].y
                     zone.width = best_layout_zones[i].width
                     zone.length = best_layout_zones[i].length
+                    zone.sqm = best_layout_zones[i].sqm  # CRITICAL: also copy the recalculated sqm
                 # Recalculate violations for best layout
                 constraint_violations = []
                 for zone in best_layout_zones:
@@ -552,6 +558,7 @@ class SpaceCalculator:
                 zone.y = best_layout_zones[i].y
                 zone.width = best_layout_zones[i].width
                 zone.length = best_layout_zones[i].length
+                zone.sqm = best_layout_zones[i].sqm  # CRITICAL: also copy the recalculated sqm
             # Recalculate violations for best layout
             constraint_violations = []
             for zone in best_layout_zones:
