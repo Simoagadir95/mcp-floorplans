@@ -424,9 +424,9 @@ class SpaceCalculator:
                     )
                     zones.append(zone)
             elif zone_type == ZoneType.PHONE_BOOTH:
-                # Each booth: 1 person, 2 sqm
+                # Each booth: 1 person, 2 sqm (fixed from ZONE_SIZING)
                 num_booths = count
-                booth_sqm = allocated_sqm / num_booths if num_booths > 0 else 2.0
+                booth_sqm = self.ZONE_SIZING[ZoneType.PHONE_BOOTH]  # Use fixed 2.0 sqm per booth
                 for i in range(num_booths):
                     zone = Zone(
                         zone_type=zone_type.value,
