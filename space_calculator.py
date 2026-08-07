@@ -412,8 +412,9 @@ class SpaceCalculator:
         ) for z in zones]
 
         # Retry loop: attempt layout, detect violations, repartition, retry
-        # Increased from 5 to 10 to allow more aggressive repartitioning
-        max_repartition_attempts = 10
+        # Increased to 50 to allow extremely aggressive repartitioning for constraint violations
+        # Each iteration tries to fix violations by aggressively resizing violating zones
+        max_repartition_attempts = 50
         best_layout_zones = None
         best_violation_count = float('inf')
 
@@ -582,17 +583,18 @@ class SpaceCalculator:
                                 continue
 
                             if "aspect ratio" in violation_msg:
-                                # AGGRESSIVE: aspect ratio violations = squeeze problem
-                                # Reduce by 30-40% to force better proportions
-                                reduction = zone.sqm * (0.30 + 0.10 * (attempt / max_repartition_attempts))
+                                # AGGRESSIVE: aspect ratio violations = extreme squeeze problem
+                                # Reduce by 50-70% to force much better proportions
+                                reduction = zone.sqm * (0.50 + 0.20 * (attempt / max_repartition_attempts))
                             elif "Min width" in violation_msg:
-                                # Width violations: reduce by 20-25% to force wider placement
-                                reduction = zone.sqm * (0.20 + 0.05 * (attempt / max_repartition_attempts))
+                                # Width violations: VERY AGGRESSIVE - reduce by 40-60% to force wider placement
+                                # Narrowness suggests zone is too large for its constraints
+                                reduction = zone.sqm * (0.40 + 0.20 * (attempt / max_repartition_attempts))
                             else:
-                                # Other violations: reduce by 15-20%
-                                reduction = zone.sqm * (0.15 + 0.05 * (attempt / max_repartition_attempts))
+                                # Other violations: reduce by 30-40%
+                                reduction = zone.sqm * (0.30 + 0.10 * (attempt / max_repartition_attempts))
 
-                            zone.sqm = max(zone.sqm * 0.5, zone.sqm - reduction)  # Never reduce below 50% of original
+                            zone.sqm = max(zone.sqm * 0.3, zone.sqm - reduction)  # Never reduce below 30% of original
 
                             # Redistribute to circulation to maintain total area
                             circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
