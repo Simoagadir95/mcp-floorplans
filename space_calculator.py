@@ -776,12 +776,46 @@ class SpaceCalculator:
 
         return distribution
 
+    def _calculate_minimum_area_for_constraints(self, zone_type: ZoneType) -> float:
+        """
+        Calculate minimum surface area required for a zone type to satisfy shape constraints.
+
+        For a zone to satisfy:
+        - width >= min_width
+        - aspect_ratio <= max_aspect_ratio
+
+        Minimum area is achieved at:
+        - width = min_width
+        - aspect_ratio = max_aspect_ratio
+        - area = width * (width * aspect_ratio) = width² * aspect_ratio
+
+        Args:
+            zone_type: Zone type enum
+
+        Returns:
+            Minimum area in sqm
+        """
+        constraints = self.SHAPE_CONSTRAINTS.get(zone_type)
+        if not constraints:
+            return 0
+
+        min_width = constraints.get("min_width", 0)
+        max_aspect = constraints.get("max_aspect_ratio", float('inf'))
+
+        if min_width <= 0 or max_aspect == float('inf'):
+            return 0
+
+        # min_area = min_width² * max_aspect_ratio
+        min_area = (min_width ** 2) * max_aspect
+        return min_area
+
     def _create_zones(self, distribution: Dict[ZoneType, int]) -> List[Zone]:
         """
         Create zone objects from distribution.
         Allocates 85% of surface to usable zones, 15% to circulation.
         DEFECT E FIX: Phone booths are FIXED SIZE (count * 2.5 sqm), not scaled by area.
         Other zones scale proportionally to fit remaining usable area.
+        DEFECT B FIX: Ensure each zone gets minimum area to satisfy shape constraints.
         """
         usable = self.calculate_usable_area()  # 85% of total surface
         circulation_sqm = self.surface_sqm * self.circulation_pct  # 15% of total
@@ -816,6 +850,45 @@ class SpaceCalculator:
             scale_factor = remaining_usable / non_booth_total
             for zone_type in non_booth_allocations:
                 zone_allocations[zone_type] *= scale_factor
+
+        # STEP 3B: DEFECT B FIX - Ensure each zone meets minimum area constraints
+        # Calculate minimum area required for each zone type to satisfy shape constraints
+        min_areas = {}
+        for zone_type in zone_allocations:
+            min_area = self._calculate_minimum_area_for_constraints(zone_type)
+            if min_area > 0:
+                min_areas[zone_type] = min_area
+                if zone_allocations[zone_type] < min_area:
+                    logger.warning(
+                        f"Zone {zone_type.value}: allocated {zone_allocations[zone_type]:.1f} sqm "
+                        f"but requires minimum {min_area:.1f} sqm to satisfy shape constraints. "
+                        f"Increasing allocation."
+                    )
+                    zone_allocations[zone_type] = min_area
+
+        # Recalculate total with adjusted allocations and rescale everything proportionally
+        new_non_booth_total = sum(v for k, v in zone_allocations.items() if k != ZoneType.PHONE_BOOTH)
+        if new_non_booth_total > remaining_usable:
+            # Allocations exceed available space - scale back down proportionally
+            scale_down = remaining_usable / new_non_booth_total if new_non_booth_total > 0 else 1.0
+            logger.warning(f"Minimum area constraints total {new_non_booth_total:.1f} sqm exceeds available {remaining_usable:.1f} sqm. Scaling down by {scale_down:.3f}")
+            for zone_type in zone_allocations:
+                if zone_type != ZoneType.PHONE_BOOTH:
+                    # Reduce but don't go below minimum
+                    new_allocation = zone_allocations[zone_type] * scale_down
+                    min_constraint = min_areas.get(zone_type, 0)
+                    if min_constraint > 0 and new_allocation < min_constraint:
+                        # Keep at minimum, will be handled during repartitioning
+                        zone_allocations[zone_type] = min_constraint
+                    else:
+                        zone_allocations[zone_type] = new_allocation
+        elif new_non_booth_total < remaining_usable:
+            # Extra space - give to open space and circulation for flexibility
+            extra_space = remaining_usable - new_non_booth_total
+            if ZoneType.OPEN_SPACE in zone_allocations:
+                zone_allocations[ZoneType.OPEN_SPACE] += extra_space
+            elif ZoneType.CIRCULATION in zone_allocations:
+                zone_allocations[ZoneType.CIRCULATION] += extra_space
 
         # Create zone objects
         for zone_type, count in distribution.items():
