@@ -21,7 +21,6 @@ from pydantic import BaseModel
 
 from oauth_middleware import add_oauth_routes, oauth_dependency, OAuthMiddleware
 from space_calculator import generate_space_layouts_json
-from server import server as mcp_server
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -308,7 +307,7 @@ async def mcp_transport(
             return JsonRpcResponse(result=result, id=request_id)
 
         elif method == "tools/call":
-            # Call a tool via the MCP server
+            # Call a tool (generate_space_layouts, etc.)
             tool_name = params.get("name")
             tool_args = params.get("arguments", {})
 
@@ -319,21 +318,30 @@ async def mcp_transport(
                 )
 
             try:
-                # Call tool through MCP server
-                response = await mcp_server.call_tool(tool_name, tool_args)
-                result = {
-                    "content": [
-                        {
-                            "type": c.type,
-                            "text": c.text if hasattr(c, 'text') else str(c)
-                        } for c in response.content
-                    ],
-                    "isError": response.is_error
-                }
-                return JsonRpcResponse(result=result, id=request_id)
-            except ValueError as e:
+                # Route tool calls
+                if tool_name == "generate_space_layouts":
+                    try:
+                        layout_json = generate_space_layouts_json(
+                            surface_sqm=float(tool_args.get("surface_sqm", 0)),
+                            headcount=int(tool_args.get("headcount", 0)),
+                            zone_types=tool_args.get("zone_types", ["open-space"]),
+                            project_id=tool_args.get("project_id", "default")
+                        )
+                        result = {"content": [{"type": "text", "text": layout_json}], "isError": False}
+                        return JsonRpcResponse(result=result, id=request_id)
+                    except Exception as e:
+                        return JsonRpcResponse(
+                            error={"code": -32603, "message": str(e)},
+                            id=request_id
+                        )
+                else:
+                    return JsonRpcResponse(
+                        error={"code": -32601, "message": f"Tool not implemented: {tool_name}"},
+                        id=request_id
+                    )
+            except Exception as e:
                 return JsonRpcResponse(
-                    error={"code": -32601, "message": str(e)},
+                    error={"code": -32603, "message": str(e)},
                     id=request_id
                 )
 
