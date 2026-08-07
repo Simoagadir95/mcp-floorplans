@@ -87,6 +87,20 @@ class SpaceCalculator:
         ZoneType.BREAK_ROOM: 1.8,  # 1.8 sqm per person (casual seating, more flexible)
     }
 
+    # Zone surface bounds (min/max sqm per zone) — STRICT LIMITS to prevent unrealistic sizing
+    # These ensure realistic dimensions per zone type. Fixed zones (e.g., phone booths) use min==max.
+    # Elastic zones (open-space, circulation) have wide bounds to absorb leftover space.
+    # Format: {zone_type: (min_sqm, max_sqm_per_unit)}
+    ZONE_SIZING_BOUNDS = {
+        ZoneType.OPEN_SPACE: (0, float('inf')),  # Elastic — expands to fill available space
+        ZoneType.MEETING: (20, float('inf')),  # Minimum 20 sqm per meeting room (4-person room)
+        ZoneType.PHONE_BOOTH: (1.5, 2.5),  # FIXED: 1.5-2.5 sqm per booth (realistic phone booth dimensions)
+        ZoneType.QUIET_ZONE: (15, float('inf')),  # Minimum 15 sqm for focus zone
+        ZoneType.BREAK_ROOM: (5.35, float('inf')),  # Minimum 5.35 sqm (as per existing spec)
+        ZoneType.STORAGE: (10, float('inf')),  # Minimum 10 sqm for storage
+        ZoneType.CIRCULATION: (0, float('inf')),  # Elastic — corridors absorb remaining space
+    }
+
     # Shape constraints (geometry guardrails to prevent degenerate dimensions)
     # min_width: minimum width in meters (to prevent thin slivers)
     # max_aspect_ratio: max ratio of long_side/short_side (to prevent extreme rectangles)
@@ -408,11 +422,23 @@ class SpaceCalculator:
             total_zone_sqm = sum(z.sqm for z in working_zones)
             tolerance = self.surface_sqm * self.circulation_tolerance
 
-            # Scale zones proportionally to match exact surface (always, not just if tolerance exceeded)
+            # DEFECT E FIX: Don't scale FIXED-SIZE zones (like phone booths)
+            # Scale only elastic zones proportionally to match exact surface
             if total_zone_sqm > 0:
-                scale_factor = self.surface_sqm / total_zone_sqm
-                for zone in working_zones:
-                    zone.sqm *= scale_factor
+                # Separate fixed and elastic zones
+                phone_booth_zones = [z for z in working_zones if z.zone_type == "phone-booth"]
+                elastic_zones = [z for z in working_zones if z.zone_type != "phone-booth"]
+
+                # Calculate totals
+                booth_sqm = sum(z.sqm for z in phone_booth_zones)
+                elastic_sqm = sum(z.sqm for z in elastic_zones)
+
+                # Scale elastic zones only
+                if elastic_sqm > 0:
+                    scale_factor = (self.surface_sqm - booth_sqm) / elastic_sqm
+                    for zone in elastic_zones:
+                        zone.sqm *= scale_factor
+                # Keep phone booth zones as-is (no scaling)
 
             # Set up coordinate system: assume rectangular envelope
             side_length = math.sqrt(self.surface_sqm)
@@ -443,17 +469,48 @@ class SpaceCalculator:
             # CRITICAL FIX FOR DEFECT 2: Ensure sqm == width * length invariant
             # The treemap creates rectangles but may not preserve the scaled sqm values due to discretization
             # Solution: Calculate each zone's actual area from geometry, then normalize all to maintain total
+            # DEFECT E FIX: Don't scale FIXED-SIZE zones (like phone booths) — scale only elastic zones
             actual_areas = [z.width * z.length for z in working_zones]
             total_actual = sum(actual_areas)
 
             if total_actual > 0:
-                # Scale all geometry proportionally so that sum of (width * length) == surface_sqm
-                scale_factor = math.sqrt(self.surface_sqm / total_actual)
-                for zone in working_zones:
-                    zone.width *= scale_factor
-                    zone.length *= scale_factor
-                    # Now sqm EXACTLY matches width * length
-                    zone.sqm = zone.width * zone.length
+                # Identify fixed-size zones that should NOT be scaled
+                fixed_zones = {z.name for z in working_zones if z.zone_type in {"phone-booth"}}
+
+                # Separate elastic and fixed zones
+                elastic_zones = [z for z in working_zones if z.name not in fixed_zones]
+                fixed_zone_objs = [z for z in working_zones if z.name in fixed_zones]
+
+                # Calculate actual areas for elastic and fixed separately
+                elastic_actual = sum(z.width * z.length for z in elastic_zones)
+                fixed_actual = sum(z.width * z.length for z in fixed_zone_objs)
+
+                # DEFECT E: For phone booth zones, scale geometry back to FIXED target size (2.5 sqm per booth)
+                # The treemap gave them larger rectangles to fit geometric constraints
+                # Now shrink them back to realistic size (1.5-2.5 sqm each)
+                phone_booth_size = self.ZONE_SIZING[ZoneType.PHONE_BOOTH]  # 2.5 sqm per booth (FIXED)
+                logger.info(f"DEFECT E FIX: Scaling {len(fixed_zone_objs)} phone booth zones back to {phone_booth_size} sqm each")
+                for zone in fixed_zone_objs:
+                    current_area = zone.width * zone.length
+                    target_sqm = phone_booth_size  # FIXED: always 2.5 sqm per phone booth
+                    if current_area > 0 and target_sqm > 0:
+                        # Scale width and length proportionally to match target area
+                        scale_factor = math.sqrt(target_sqm / current_area)
+                        old_width, old_length, old_sqm = zone.width, zone.length, zone.sqm
+                        zone.width *= scale_factor
+                        zone.length *= scale_factor
+                        zone.sqm = target_sqm  # Enforce FIXED size
+                        logger.info(f"  {zone.name}: {old_width:.2f}m x {old_length:.2f}m ({old_sqm:.1f} sqm) -> {zone.width:.2f}m x {zone.length:.2f}m ({zone.sqm:.1f} sqm)")
+
+                # Calculate scaling factor for elastic zones only
+                target_total = self.surface_sqm
+                booth_sqm_total = sum(z.sqm for z in fixed_zone_objs)
+                if elastic_actual > 0:
+                    scale_factor = math.sqrt((target_total - booth_sqm_total) / elastic_actual)
+                    for zone in elastic_zones:
+                        zone.width *= scale_factor
+                        zone.length *= scale_factor
+                        zone.sqm = zone.width * zone.length
 
             # NOW check shape constraints on final geometry
             # CRITICAL: Check ALL zones, including those without dimensions (treat as invalid)
@@ -491,12 +548,16 @@ class SpaceCalculator:
             # If no constraint violations, success!
             if not constraint_violations:
                 # Copy back to original zones list (including sqm which was just recalculated)
-                for i, zone in enumerate(zones):
-                    zone.x = working_zones[i].x
-                    zone.y = working_zones[i].y
-                    zone.width = working_zones[i].width
-                    zone.length = working_zones[i].length
-                    zone.sqm = working_zones[i].sqm  # CRITICAL: also copy the recalculated sqm
+                # Use zone name mapping to handle reordering from repartitioning
+                working_map = {z.name: z for z in working_zones}
+                for zone in zones:
+                    if zone.name in working_map:
+                        wz = working_map[zone.name]
+                        zone.x = wz.x
+                        zone.y = wz.y
+                        zone.width = wz.width
+                        zone.length = wz.length
+                        zone.sqm = wz.sqm  # CRITICAL: also copy the recalculated sqm
                 logger.info(f"Layout converged at attempt {attempt+1}")
                 return zones, []
 
@@ -513,6 +574,13 @@ class SpaceCalculator:
                 for zone_name, violation_msg in violation_map.items():
                     for zone in working_zones:
                         if zone.name == zone_name:
+                            # DEFECT E FIX: Phone booths are FIXED SIZE (2.5 sqm per booth)
+                            # Do NOT repartition phone booths — they maintain their size
+                            # If they violate shape constraints, accept it as a known limitation
+                            if zone.zone_type == "phone-booth":
+                                # Skip repartitioning for phone booths
+                                continue
+
                             if "aspect ratio" in violation_msg:
                                 # AGGRESSIVE: aspect ratio violations = squeeze problem
                                 # Reduce by 30-40% to force better proportions
@@ -554,12 +622,16 @@ class SpaceCalculator:
             # Max attempts reached; use best layout found
             if best_layout_zones:
                 logger.warning(f"Layout did not converge after {max_repartition_attempts} attempts. Using best layout found ({best_violation_count} violations).")
-                for i, zone in enumerate(zones):
-                    zone.x = best_layout_zones[i].x
-                    zone.y = best_layout_zones[i].y
-                    zone.width = best_layout_zones[i].width
-                    zone.length = best_layout_zones[i].length
-                    zone.sqm = best_layout_zones[i].sqm  # CRITICAL: also copy the recalculated sqm
+                # Use zone name mapping to handle reordering from repartitioning
+                best_map = {z.name: z for z in best_layout_zones}
+                for zone in zones:
+                    if zone.name in best_map:
+                        bz = best_map[zone.name]
+                        zone.x = bz.x
+                        zone.y = bz.y
+                        zone.width = bz.width
+                        zone.length = bz.length
+                        zone.sqm = bz.sqm  # CRITICAL: also copy the recalculated sqm
                 # Recalculate violations for best layout
                 constraint_violations = []
                 for zone in best_layout_zones:
@@ -570,12 +642,16 @@ class SpaceCalculator:
 
         # Return best layout found
         if best_layout_zones:
-            for i, zone in enumerate(zones):
-                zone.x = best_layout_zones[i].x
-                zone.y = best_layout_zones[i].y
-                zone.width = best_layout_zones[i].width
-                zone.length = best_layout_zones[i].length
-                zone.sqm = best_layout_zones[i].sqm  # CRITICAL: also copy the recalculated sqm
+            # Use zone name mapping to handle reordering from repartitioning
+            best_map = {z.name: z for z in best_layout_zones}
+            for zone in zones:
+                if zone.name in best_map:
+                    bz = best_map[zone.name]
+                    zone.x = bz.x
+                    zone.y = bz.y
+                    zone.width = bz.width
+                    zone.length = bz.length
+                    zone.sqm = bz.sqm  # CRITICAL: also copy the recalculated sqm
             # Recalculate violations for best layout
             constraint_violations = []
             for zone in best_layout_zones:
@@ -704,15 +780,16 @@ class SpaceCalculator:
         """
         Create zone objects from distribution.
         Allocates 85% of surface to usable zones, 15% to circulation.
+        DEFECT E FIX: Phone booths are FIXED SIZE (count * 2.5 sqm), not scaled by area.
+        Other zones scale proportionally to fit remaining usable area.
         """
         usable = self.calculate_usable_area()  # 85% of total surface
         circulation_sqm = self.surface_sqm * self.circulation_pct  # 15% of total
         zones = []
-        zone_counter = {}
 
-        # Calculate total sqm needed for all zones
-        total_calculated = 0
+        # STEP 1: Calculate base allocations
         zone_allocations = {}
+        phone_booth_sqm = 0  # Track phone booth space (FIXED)
 
         for zone_type, count in distribution.items():
             if count == 0:
@@ -721,19 +798,24 @@ class SpaceCalculator:
             sqm_per_person = self.ZONE_SIZING.get(zone_type, 4.0)
 
             if zone_type == ZoneType.STORAGE:
-                # Storage gets 5% of usable area
                 zone_allocations[zone_type] = usable * 0.05
+            elif zone_type == ZoneType.PHONE_BOOTH:
+                # PHONE BOOTH: FIXED SIZE (count * 2.5 sqm per booth, never scale or adjust)
+                zone_allocations[zone_type] = count * sqm_per_person
+                phone_booth_sqm = zone_allocations[zone_type]
             else:
                 zone_allocations[zone_type] = count * sqm_per_person
-                total_calculated += zone_allocations[zone_type]
 
-        # Normalize allocations to fit usable area (85% of total)
-        # Scale all zones proportionally to fit exactly in usable area
-        if total_calculated > 0 and total_calculated != usable:
-            scale_factor = usable / total_calculated
-            for zone_type in zone_allocations:
-                if zone_type != ZoneType.STORAGE:
-                    zone_allocations[zone_type] *= scale_factor
+        # STEP 2: Calculate total of non-phone-booth allocations
+        non_booth_allocations = {k: v for k, v in zone_allocations.items() if k != ZoneType.PHONE_BOOTH}
+        non_booth_total = sum(non_booth_allocations.values())
+
+        # STEP 3: Scale non-phone-booth zones to fit remaining usable area
+        remaining_usable = usable - phone_booth_sqm
+        if non_booth_total > 0 and remaining_usable > 0:
+            scale_factor = remaining_usable / non_booth_total
+            for zone_type in non_booth_allocations:
+                zone_allocations[zone_type] *= scale_factor
 
         # Create zone objects
         for zone_type, count in distribution.items():
@@ -767,15 +849,14 @@ class SpaceCalculator:
                     )
                     zones.append(zone)
             elif zone_type == ZoneType.PHONE_BOOTH:
-                # Each booth: 1-2 people, 2.5 sqm per booth FIXED (not scaled by headcount)
-                # Allocation logic: num_booths = allocated_sqm / booth_sqm
-                # This ensures each booth gets ~2.5 sqm, not allocations scaled per person
-                booth_sqm_fixed = self.ZONE_SIZING[ZoneType.PHONE_BOOTH]  # 2.5 sqm per booth
-                # Calculate number of booths from allocated area, respect minimum of 1
-                num_booths = max(1, int(allocated_sqm / booth_sqm_fixed))
-                # Total area for booths = num_booths * booth_sqm_fixed (may differ from allocated_sqm due to rounding)
-                # Distribute allocated area evenly across booths
-                sqm_per_booth = allocated_sqm / num_booths if num_booths > 0 else booth_sqm_fixed
+                # DEFECT E FIX: Phone booths are FIXED SIZE (1.5-2.5 sqm per booth), NOT scaled by area allocation
+                # Use distribution count (headcount-based), not recalculated from area
+                # Number of booths = distribution count, each booth = 2.5 sqm (realistic)
+                booth_sqm_fixed = self.ZONE_SIZING[ZoneType.PHONE_BOOTH]  # 2.5 sqm per booth (FIXED)
+                num_booths = count  # Use distribution count, not allocated_sqm / booth_sqm
+
+                # Each booth gets exactly booth_sqm_fixed (2.5 sqm)
+                sqm_per_booth = booth_sqm_fixed
 
                 for i in range(num_booths):
                     # Occupancy: typically 1-2 people per booth
