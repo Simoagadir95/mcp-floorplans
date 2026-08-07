@@ -65,6 +65,12 @@ class LayoutVariant:
     metrics: SpaceMetrics
     floorplan_stub_url: str  # stub:/// URL (no real image generation)
     design_notes: str
+    constraint_violations: List[str] = None  # Shape constraint violations detected during layout
+
+    def __post_init__(self):
+        """Ensure constraint_violations is a list."""
+        if self.constraint_violations is None:
+            self.constraint_violations = []
 
 
 class SpaceCalculator:
@@ -351,7 +357,7 @@ class SpaceCalculator:
 
         return True, ""
 
-    def _apply_geometric_layout(self, zones: List[Zone]) -> List[Zone]:
+    def _apply_geometric_layout(self, zones: List[Zone]) -> Tuple[List[Zone], List[str]]:
         """
         Apply squarified treemap layout to zones.
         Adds x, y, width, length coordinates to each zone.
@@ -360,11 +366,14 @@ class SpaceCalculator:
           - exact surface conservation
           - NO zones violate min_width or max_aspect_ratio constraints in output
 
+        Returns:
+            Tuple of (zones, constraint_violations)
+
         Raises:
             ValueError: if layout cannot satisfy all constraints
         """
         if not zones:
-            return zones
+            return zones, []
 
         # Validate total area and scale zones to match exact surface
         total_zone_sqm = sum(z.sqm for z in zones)
@@ -422,7 +431,7 @@ class SpaceCalculator:
                 violations_text = "; ".join(constraint_violations)
                 circ_zones[0].notes += f" [SHAPE CONSTRAINT VIOLATIONS DETECTED: {violations_text}]"
 
-        return zones
+        return zones, constraint_violations
 
     def _verify_no_overlaps(self, zones: List[Zone]) -> None:
         """
@@ -783,8 +792,8 @@ class SpaceCalculator:
         variants = []
         distribution = self._distribute_zones()
         base_zones = self._create_zones(distribution)
-        # Apply geometric layout (treemap)
-        base_zones = self._apply_geometric_layout(base_zones)
+        # Apply geometric layout (treemap) — returns (zones, violations)
+        base_zones, base_violations = self._apply_geometric_layout(base_zones)
         metrics = self.calculate_metrics(base_zones)
 
         # Variant 1: Balanced (base)
@@ -794,7 +803,8 @@ class SpaceCalculator:
             zones=base_zones,
             metrics=metrics,
             floorplan_stub_url=f"stub:///floorplans/balanced-001.png",
-            design_notes=f"Balanced mix of collaborative and focus areas. {metrics.workstations} workstations, {metrics.meeting_rooms} meeting rooms."
+            design_notes=f"Balanced mix of collaborative and focus areas. {metrics.workstations} workstations, {metrics.meeting_rooms} meeting rooms.",
+            constraint_violations=base_violations
         )
         variants.append(variant_1)
 
@@ -807,7 +817,7 @@ class SpaceCalculator:
             )
             collab_dist = collab_calc._distribute_zones()
             collab_zones = collab_calc._create_zones(collab_dist)
-            collab_zones = collab_calc._apply_geometric_layout(collab_zones)
+            collab_zones, collab_violations = collab_calc._apply_geometric_layout(collab_zones)
             collab_metrics = collab_calc.calculate_metrics(collab_zones)
 
             variant_2 = LayoutVariant(
@@ -816,7 +826,8 @@ class SpaceCalculator:
                 zones=collab_zones,
                 metrics=collab_metrics,
                 floorplan_stub_url=f"stub:///floorplans/collaboration-heavy-002.png",
-                design_notes=f"Maximizes collaborative spaces. {collab_metrics.collaboration_zones_pct:.1f}% collaboration zone."
+                design_notes=f"Maximizes collaborative spaces. {collab_metrics.collaboration_zones_pct:.1f}% collaboration zone.",
+                constraint_violations=collab_violations
             )
             variants.append(variant_2)
 
@@ -829,7 +840,7 @@ class SpaceCalculator:
             )
             focus_dist = focus_calc._distribute_zones()
             focus_zones = focus_calc._create_zones(focus_dist)
-            focus_zones = focus_calc._apply_geometric_layout(focus_zones)
+            focus_zones, focus_violations = focus_calc._apply_geometric_layout(focus_zones)
             focus_metrics = focus_calc.calculate_metrics(focus_zones)
 
             variant_3 = LayoutVariant(
@@ -838,7 +849,8 @@ class SpaceCalculator:
                 zones=focus_zones,
                 metrics=focus_metrics,
                 floorplan_stub_url=f"stub:///floorplans/focus-intensive-003.png",
-                design_notes=f"Maximizes focus areas and quiet zones. {focus_metrics.collaboration_zones_pct:.1f}% collaboration zone."
+                design_notes=f"Maximizes focus areas and quiet zones. {focus_metrics.collaboration_zones_pct:.1f}% collaboration zone.",
+                constraint_violations=focus_violations
             )
             variants.append(variant_3)
 
@@ -883,6 +895,7 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
                 "zones": [asdict(z) for z in v.zones],
                 "metrics": asdict(v.metrics),
                 "design_notes": v.design_notes,
+                "constraint_violations": v.constraint_violations if v.constraint_violations else [],
             }
             for v in variants
         ]
