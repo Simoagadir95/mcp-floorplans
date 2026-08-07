@@ -223,6 +223,7 @@ class SpaceCalculator:
         """
         Apply squarified treemap layout to zones.
         Adds x, y, width, length coordinates to each zone.
+        Ensures ALL zones receive coordinates (uses fallback row-packing for missing zones).
         """
         if not zones:
             return zones
@@ -240,7 +241,8 @@ class SpaceCalculator:
         # Start squarification from top-left
         self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [])
 
-        # Assign coordinates to zones
+        # Assign coordinates to zones from treemap
+        zones_with_coords = set()
         for zone in zones:
             if zone.name in rectangles:
                 x, y, w, h = rectangles[zone.name]
@@ -248,8 +250,72 @@ class SpaceCalculator:
                 zone.y = y
                 zone.width = w
                 zone.length = h
+                zones_with_coords.add(zone.name)
+
+        # Fallback: for zones without coordinates, use row-packing algorithm
+        missing_zones = [z for z in zones if z.name not in zones_with_coords]
+        if missing_zones:
+            # Use deterministic row-packing for missing zones
+            placements = self._row_pack_zones_deterministic(missing_zones, side_length)
+            for placement in placements:
+                zone_name = placement["zone_name"]
+                for zone in zones:
+                    if zone.name == zone_name:
+                        zone.x = placement["x"]
+                        zone.y = placement["y"]
+                        zone.width = placement["width"]
+                        zone.length = placement["height"]
+                        break
 
         return zones
+
+    def _row_pack_zones_deterministic(self, zones: List[Zone], container_size: float) -> List[Dict]:
+        """
+        Row-packing fallback for zones that didn't get treemap coordinates.
+        Deterministic: no randomness, reproducible for same input.
+
+        Args:
+            zones: List of Zone objects without coordinates
+            container_size: Size of container (width = height)
+
+        Returns:
+            List of placement dicts with x, y, width, height, zone_name
+        """
+        placements = []
+
+        # Sort zones by area descending (larger zones first)
+        sorted_zones = sorted(zones, key=lambda z: -z.sqm)
+
+        current_x = 0.0
+        current_y = 0.0
+        row_height = 0.0
+        max_row_width = container_size
+
+        for zone in sorted_zones:
+            aspect = 1.0  # Square-ish
+            zone_width = math.sqrt(zone.sqm / aspect)
+            zone_height = zone.sqm / zone_width
+
+            # Check if zone fits in current row
+            if current_x + zone_width > max_row_width:
+                # Start new row
+                current_x = 0.0
+                current_y += row_height
+                row_height = 0.0
+
+            # Place zone
+            placements.append({
+                "zone_name": zone.name,
+                "x": current_x,
+                "y": current_y,
+                "width": zone_width,
+                "height": zone_height
+            })
+
+            current_x += zone_width
+            row_height = max(row_height, zone_height)
+
+        return placements
 
     def calculate_usable_area(self) -> float:
         """Calculate usable area after accounting for circulation."""
