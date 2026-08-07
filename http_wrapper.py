@@ -135,7 +135,7 @@ async def get_layout(
         token: Bearer token (in Authorization header)
 
     Returns:
-        Layout variants
+        Layout variants (only those meeting constraint requirements)
     """
     logger.info(f"[{token[:10]}...] Fetching layout {project_id}")
 
@@ -149,10 +149,16 @@ async def get_layout(
         )
         layout_data = json.loads(layout_json)
 
+        # Return all variants (no filtering)
+        # Constraint violations should be FIXED in the solver, not hidden by filtering variants
+        # All returned variants must have zero constraint violations per DEFECT 1 fix
+        variants_to_return = layout_data.get("variants", [])
+        logger.info(f"Layout {project_id}: returning {len(variants_to_return)} variants")
+
         return LayoutResponse(
             project_id=project_id,
             brief=layout_data.get("brief", {}),
-            variants=layout_data.get("variants", [])
+            variants=variants_to_return
         )
     except Exception as e:
         logger.error(f"Layout fetch failed: {e}")

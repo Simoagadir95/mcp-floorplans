@@ -216,5 +216,54 @@ def test_surface_conservation():
     )
 
 
+def test_sqm_geometry_invariant():
+    """
+    DEFECT 2 FIX: Test that sqm == width * length for every zone (within 1e-6 tolerance).
+
+    This ensures the geometry drawn on the canvas matches the sqm value displayed to the user.
+    If this invariant is violated, the user sees a 23.61 m² label on a rectangle that's actually 14.17 m².
+    """
+    surface_sqm = 400.0
+    calc = SpaceCalculator(
+        surface_sqm=surface_sqm,
+        headcount=40,
+        zone_types=["open-space", "meeting", "quiet-zone", "phone-booth", "break-room"],
+        collaboration_style="medium_collab"
+    )
+
+    variants = calc.generate_variants(num_variants=3)
+
+    tolerance = 1e-6  # 1 millionth of a square meter
+    max_deviation = 0.0
+
+    print(f"\nSQM/Geometry Invariant Test (tolerance: {tolerance}):")
+    print(f"{'Zone Name':<25} {'Width':<10} {'Length':<10} {'Rect (w*l)':<12} {'SQM':<12} {'Deviation':<12}")
+    print(f"{'-'*80}")
+
+    for variant_idx, variant in enumerate(variants):
+        print(f"\nVariant {variant_idx + 1}: {variant.layout_name}")
+
+        for zone in variant.zones:
+            if zone.width is None or zone.length is None:
+                continue
+
+            rect_area = zone.width * zone.length
+            deviation = abs(rect_area - zone.sqm)
+            max_deviation = max(max_deviation, deviation)
+
+            status = "✓" if deviation <= tolerance else "✗ RED"
+
+            print(f"  {zone.name:<23} {zone.width:<10.4f} {zone.length:<10.4f} {rect_area:<12.4f} {zone.sqm:<12.4f} {deviation:<12.8f} {status}")
+
+            assert deviation <= tolerance, (
+                f"Zone {zone.name}: sqm ({zone.sqm:.4f}) does not match geometry "
+                f"({zone.width:.4f}m x {zone.length:.4f}m = {rect_area:.4f}) "
+                f"by {deviation:.8f} sqm (tolerance: {tolerance})"
+            )
+
+    print(f"\n{'='*80}")
+    print(f"✓ SQM/GEOMETRY INVARIANT PASSED (max deviation: {max_deviation:.8f} sqm)")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

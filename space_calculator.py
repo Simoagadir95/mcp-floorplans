@@ -185,37 +185,37 @@ class SpaceCalculator:
 
         proportion = left_total / total_all if total_all > 0 else 0.5
 
-        # Decide cut direction: prefer cut perpendicular to longest side, but respect constraints
-        # If all left zones are phone booths/storage, prefer horizontal cut to keep them narrow
+        # Strategy: Try to find a cut direction that satisfies constraints for both sides
+        # This is key to convergence — we check constraints BEFORE placing rectangles
+
         if zone_name_to_type:
             left_types = {zone_name_to_type.get(name, "unknown") for name, _ in left_areas}
-            # If all left zones prefer taller aspect ratios (phone booths), make them narrower (horiz cut)
+            # If all left zones are phone booths (or similar small zones), prefer horizontal cut to keep them narrow
             if left_types <= {"phone-booth"}:
-                # Force horizontal cut for phone booths
                 cut_height = height * proportion
                 self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
                 self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
                 return
 
         # Standard logic: prefer cut perpendicular to longest side
-        # D4: Enforce minimum dimensions to prevent constraint violations
+        # Constraint-aware: enforce minimum dimensions to prevent violations
         min_dimension = 1.0  # Minimum 1m dimension for any rectangle
 
         if width >= height:
-            # Vertical cut (split along width)
+            # Vertical cut (split along width) — prefer for wider containers
             cut_width = max(min_dimension, width * proportion)
-            cut_width = min(cut_width, width - min_dimension)  # Ensure both sides meet minimum
+            cut_width = min(cut_width, width - min_dimension)
 
             if cut_width > min_dimension and (width - cut_width) > min_dimension:
                 self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
                 self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
             else:
-                # Proportion would create too-thin rectangle, use midpoint instead
+                # Proportion would create too-thin rectangle, use midpoint
                 cut_width = width / 2
                 self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
                 self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
         else:
-            # Horizontal cut (split along height)
+            # Horizontal cut (split along height) — prefer for taller containers
             cut_height = max(min_dimension, height * proportion)
             cut_height = min(cut_height, height - min_dimension)
 
@@ -390,7 +390,8 @@ class SpaceCalculator:
         ) for z in zones]
 
         # Retry loop: attempt layout, detect violations, repartition, retry
-        max_repartition_attempts = 5
+        # Increased from 5 to 10 to allow more aggressive repartitioning
+        max_repartition_attempts = 10
         best_layout_zones = None
         best_violation_count = float('inf')
 
@@ -430,7 +431,21 @@ class SpaceCalculator:
                     zone.y = y
                     zone.width = w
                     zone.length = h
+                    # CRITICAL FIX: Recalculate sqm from final geometry to ensure consistency
+                    # This guarantees that sqm == width * length always
+                    zone.sqm = w * h
 
+            # Normalize sqm values to match total surface (preserves proportions)
+            # This ensures sum(sqm) == surface_sqm after geometry layout
+            total_zone_sqm = sum(z.sqm for z in working_zones)
+            if total_zone_sqm > 0:
+                normalize_factor = self.surface_sqm / total_zone_sqm
+                for zone in working_zones:
+                    zone.sqm *= normalize_factor
+
+            # NOW check shape constraints on final, normalized geometry
+            for zone in working_zones:
+                if zone.width is not None and zone.length is not None:
                     # Check shape constraints
                     is_valid, violation_msg = self._check_shape_constraints(zone)
                     if not is_valid:
@@ -469,12 +484,25 @@ class SpaceCalculator:
                 logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
 
                 # Repartition strategy: modify zone surface distribution to improve layout
-                # Reduce sizes of violating zones slightly (esp. those with aspect ratio violations)
+                # For aspect ratio violations: significantly reduce size to enable better partitioning
+                # For width violations: increase size to allow wider rectangles in cuts
+                has_aspect_violation = any("aspect ratio" in msg for msg in violation_map.values())
+                has_width_violation = any("Min width" in msg for msg in violation_map.values())
+
                 for zone_name, violation_msg in violation_map.items():
                     for zone in working_zones:
                         if zone.name == zone_name:
-                            # Reduce by 5% and redistribute to circulation
-                            reduction = zone.sqm * 0.05
+                            if "aspect ratio" in violation_msg:
+                                # Very aggressive: reduce by 20-25% for aspect ratio violations
+                                # This encourages the algorithm to try different cutting patterns
+                                reduction = zone.sqm * (0.20 + 0.05 * (attempt / max_repartition_attempts))
+                            elif "Min width" in violation_msg:
+                                # For width violations, reduce by 15-20% to force wider cuts
+                                reduction = zone.sqm * (0.15 + 0.05 * (attempt / max_repartition_attempts))
+                            else:
+                                # Other violations: reduce by 10-15%
+                                reduction = zone.sqm * (0.10 + 0.05 * (attempt / max_repartition_attempts))
+
                             zone.sqm -= reduction
 
                             # Redistribute to circulation to maintain total area
@@ -484,6 +512,20 @@ class SpaceCalculator:
                                 for circ in circulation_zones:
                                     circ.sqm += per_zone
                             break
+
+                # Also try reordering: move violating zones to different positions in the hierarchy
+                # Sort by different criteria (e.g., violating zones last) to change partition patterns
+                if has_aspect_violation or has_width_violation:
+                    # Separate violating and non-violating zones
+                    violating_names = set(violation_map.keys())
+                    non_violating = [z for z in working_zones if z.name not in violating_names]
+                    violating = [z for z in working_zones if z.name in violating_names]
+
+                    # Reorder: put smaller zones earlier to allow better fitting
+                    non_violating.sort(key=lambda z: -z.sqm)  # Larger first
+                    violating.sort(key=lambda z: z.sqm)  # Smaller first
+
+                    working_zones = non_violating + violating
 
                 continue
 

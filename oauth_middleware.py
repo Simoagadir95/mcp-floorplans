@@ -33,6 +33,7 @@ OAUTH_ISSUER = os.getenv("OAUTH_ISSUER")
 OAUTH_JWKS_URI = os.getenv("OAUTH_JWKS_URI")
 OAUTH_RESOURCE_AUDIENCE = os.getenv("OAUTH_RESOURCE_AUDIENCE", "urn:virtus:mcp-floorplans")
 DEVELOPMENT_MODE_TOKEN = os.getenv("DEVELOPMENT_MODE_TOKEN")  # For testing only: shared token
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8851")  # Public URL for resource metadata
 
 # Flag: if no issuer/JWKS configured, check for development mode token
 OAUTH_CONFIGURED = bool(OAUTH_ISSUER and OAUTH_JWKS_URI)
@@ -86,7 +87,8 @@ def validate_bearer_token(request: Request) -> str:
     if not auth_header:
         # No auth header — return 401 with WWW-Authenticate pointing to PRM URI
         # RFC 9728: resource_metadata should be a URI, not inline JSON
-        prm_uri = f"{str(request.base_url).rstrip('/')}/.well-known/oauth-protected-resource"
+        # Use PUBLIC_BASE_URL to avoid container IP appearing in client-facing headers
+        prm_uri = f"{PUBLIC_BASE_URL.rstrip('/')}/.well-known/oauth-protected-resource"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization required",
@@ -336,7 +338,8 @@ class OAuthMiddleware:
             if not auth_header or not auth_header.startswith("Bearer "):
                 # Return 401 without proceeding
                 # RFC 9728: include resource_metadata pointing to PRM URI
-                prm_uri = f"http://{scope.get('server', ['localhost', 8851])[0]}:{scope.get('server', ['localhost', 8851])[1]}/.well-known/oauth-protected-resource"
+                # Use PUBLIC_BASE_URL to avoid container IP appearing in client-facing headers
+                prm_uri = f"{PUBLIC_BASE_URL.rstrip('/')}/.well-known/oauth-protected-resource"
                 www_auth_header = f'Bearer realm="mcp-floorplans", resource_metadata="{prm_uri}"'
                 await send({
                     "type": "http.response.start",
