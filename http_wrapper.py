@@ -225,7 +225,7 @@ async def mcp_transport(
         # Route to MCP server methods
         if method == "initialize":
             result = {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2026-07-28",
                 "capabilities": {
                     "logging": {},
                     "tools": {}
