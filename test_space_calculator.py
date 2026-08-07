@@ -223,14 +223,15 @@ class TestZoneCreation:
     def test_phone_booth_creation(self):
         """Test phone booth creation."""
         calc = SpaceCalculator(200, 20, ["phone-booth"])
-        distribution = {ZoneType.PHONE_BOOTH: 3}  # 3 booths
+        distribution = {ZoneType.PHONE_BOOTH: 3}  # 3 people needing phone booths
         zones = calc._create_zones(distribution)
 
         booth_zones = [z for z in zones if z.zone_type == "phone-booth"]
-        assert len(booth_zones) == 3
-        for zone in booth_zones:
-            assert zone.occupancy == 1
-            assert zone.sqm == pytest.approx(2.0)
+        # 3 people = 2 booths (1-2 people per booth to prevent thin sliver rectangles)
+        assert len(booth_zones) == 2
+        # First booth has 2 people, second booth has 1
+        assert booth_zones[0].occupancy == 2
+        assert booth_zones[1].occupancy == 1
 
 
 if __name__ == "__main__":

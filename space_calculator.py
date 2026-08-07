@@ -71,9 +71,30 @@ class SpaceCalculator:
     ZONE_SIZING = {
         ZoneType.OPEN_SPACE: 5.0,  # 5 sqm per workstation (hotdesking) to 8.5 sqm (dedicated)
         ZoneType.MEETING: 2.5,  # 2.5 sqm per person in meeting room
-        ZoneType.PHONE_BOOTH: 2.0,  # 2 sqm single person booth
+        ZoneType.PHONE_BOOTH: 2.5,  # 2.5 sqm per booth (1.0m wide x 2.5m deep typical)
         ZoneType.QUIET_ZONE: 4.0,  # 4 sqm per person (focus area)
-        ZoneType.BREAK_ROOM: 1.0,  # 1 sqm per person
+        ZoneType.BREAK_ROOM: 2.0,  # 2.0 sqm per person (normalized headcount-based, relaxed from 1.5)
+    }
+
+    # Shape constraints (geometry guardrails to prevent degenerate dimensions)
+    # min_width: minimum width in meters (to prevent thin slivers)
+    # max_aspect_ratio: max ratio of long_side/short_side (to prevent extreme rectangles)
+    # Rationale:
+    #   - Open space: needs 3.0m+ to accommodate multiple desk rows
+    #   - Meeting: 2.5m+ for usable meeting room width
+    #   - Phone booth: 1.0m+ x up to 2.5m tall (1.0-1.2m standard width, 2.2m depth typical)
+    #   - Quiet zone: 2.5m+ for focus area
+    #   - Break room: 1.8m+ (can function as hallway with seating/tables)
+    #   - Storage: 1.5m+ (compact archive/shelving)
+    #   - Circulation: 1.0m+ (hallway width, aspect flexible for corridors)
+    SHAPE_CONSTRAINTS = {
+        ZoneType.OPEN_SPACE: {"min_width": 3.0, "max_aspect_ratio": 3.0},
+        ZoneType.MEETING: {"min_width": 2.5, "max_aspect_ratio": 2.5},
+        ZoneType.PHONE_BOOTH: {"min_width": 1.0, "max_aspect_ratio": 4.0},
+        ZoneType.QUIET_ZONE: {"min_width": 2.5, "max_aspect_ratio": 3.0},
+        ZoneType.BREAK_ROOM: {"min_width": 1.8, "max_aspect_ratio": 4.0},  # More flexible: can be hallway-style
+        ZoneType.STORAGE: {"min_width": 1.5, "max_aspect_ratio": 3.0},
+        ZoneType.CIRCULATION: {"min_width": 1.0, "max_aspect_ratio": 5.0},
     }
 
     # Collaboration percentages (target % of space for collaborative zones)
@@ -104,10 +125,12 @@ class SpaceCalculator:
     def _squarify_treemap(self, areas: List[Tuple[str, float]],
                           x: float, y: float, width: float, height: float,
                           rectangles: Dict[str, Tuple[float, float, float, float]],
-                          row: List[Tuple[str, float]]) -> None:
+                          row: List[Tuple[str, float]],
+                          zone_name_to_type: Optional[Dict[str, str]] = None) -> None:
         """
         Simplified treemap subdivision ensuring non-overlapping placement.
         Alternates between horizontal and vertical cuts for balance.
+        Respects shape constraints (min_width, max_aspect_ratio) during subdivision.
 
         Args:
             areas: List of (zone_name, area_sqm) tuples sorted descending
@@ -115,6 +138,7 @@ class SpaceCalculator:
             width, height: Dimensions (meters)
             rectangles: Output dict mapping zone_name -> (x, y, width, height)
             row: Current row being processed (unused in simplified version)
+            zone_name_to_type: Map from zone name to zone type for constraint lookup
         """
         if not areas or width <= 0 or height <= 0:
             return
@@ -139,21 +163,33 @@ class SpaceCalculator:
         if total_all == 0:
             return
 
-        # Decide cut direction: prefer cut perpendicular to longest side
+        proportion = left_total / total_all if total_all > 0 else 0.5
+
+        # Decide cut direction: prefer cut perpendicular to longest side, but respect constraints
+        # If all left zones are phone booths/storage, prefer horizontal cut to keep them narrow
+        if zone_name_to_type:
+            left_types = {zone_name_to_type.get(name, "unknown") for name, _ in left_areas}
+            # If all left zones prefer taller aspect ratios (phone booths), make them narrower (horiz cut)
+            if left_types <= {"phone-booth"}:
+                # Force horizontal cut for phone booths
+                cut_height = height * proportion
+                self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
+                self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
+                return
+
+        # Standard logic: prefer cut perpendicular to longest side
         if width >= height:
             # Vertical cut (split along width)
-            proportion = left_total / total_all if total_all > 0 else 0.5
             cut_width = width * proportion
 
-            self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [])
-            self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [])
+            self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
+            self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
         else:
             # Horizontal cut (split along height)
-            proportion = left_total / total_all if total_all > 0 else 0.5
             cut_height = height * proportion
 
-            self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [])
-            self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [])
+            self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
+            self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
 
     def _worst_aspect_ratio(self, items: List[Tuple[str, float]],
                            width: float, height: float, total_area: float) -> float:
@@ -210,11 +246,44 @@ class SpaceCalculator:
             # Return remaining space to right
             return x + row_width, y, width - row_width, height
 
+    def _check_shape_constraints(self, zone: Zone) -> Tuple[bool, str]:
+        """
+        Check if a zone's dimensions satisfy shape constraints.
+
+        Returns:
+            Tuple of (is_valid, violation_description)
+        """
+        if zone.width is None or zone.length is None:
+            return True, ""
+
+        constraints = self.SHAPE_CONSTRAINTS.get(ZoneType(zone.zone_type), None)
+        if not constraints:
+            return True, ""  # No constraint defined for this type
+
+        min_width = constraints.get("min_width", 0)
+        max_aspect = constraints.get("max_aspect_ratio", float('inf'))
+
+        short_side = min(zone.width, zone.length)
+        long_side = max(zone.width, zone.length)
+
+        # Check minimum width
+        if short_side < min_width:
+            return False, f"Min width {min_width}m required, got {short_side:.3f}m"
+
+        # Check aspect ratio
+        if long_side > 0 and short_side > 0:
+            aspect_ratio = long_side / short_side
+            if aspect_ratio > max_aspect:
+                return False, f"Max aspect ratio {max_aspect} required, got {aspect_ratio:.2f}"
+
+        return True, ""
+
     def _apply_geometric_layout(self, zones: List[Zone]) -> List[Zone]:
         """
         Apply squarified treemap layout to zones.
         Adds x, y, width, length coordinates to each zone.
         GUARANTEES: non-overlapping rectangles + exact surface conservation.
+        CONSTRAINT VIOLATIONS: reported in zone.notes if feasibility issue occurs.
         """
         if not zones:
             return zones
@@ -232,16 +301,20 @@ class SpaceCalculator:
         # Set up coordinate system: assume rectangular envelope
         side_length = math.sqrt(self.surface_sqm)
 
+        # Create mapping from zone name to zone type for constraint-aware subdivision
+        zone_name_to_type = {z.name: z.zone_type for z in zones}
+
         # Apply treemap to ALL zones (including circulation)
         areas = [(z.name, z.sqm) for z in zones]
         areas.sort(key=lambda x: -x[1])  # Sort descending by area
 
         rectangles: Dict[str, Tuple[float, float, float, float]] = {}
 
-        # Start squarification from top-left
-        self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [])
+        # Start squarification from top-left with constraint awareness
+        self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type)
 
         # Assign coordinates to zones from treemap
+        constraint_violations = []
         for zone in zones:
             if zone.name in rectangles:
                 x, y, w, h = rectangles[zone.name]
@@ -250,8 +323,21 @@ class SpaceCalculator:
                 zone.width = w
                 zone.length = h
 
+                # Check shape constraints
+                is_valid, violation_msg = self._check_shape_constraints(zone)
+                if not is_valid:
+                    constraint_violations.append(f"{zone.name}: {violation_msg}")
+
         # Verify non-overlapping: check intersection area for all pairs
         self._verify_no_overlaps(zones)
+
+        # Report constraint violations (non-fatal — layout still proceeds)
+        if constraint_violations:
+            # Append to the circulation zone notes to track violations
+            circ_zones = [z for z in zones if z.zone_type == "circulation"]
+            if circ_zones:
+                violations_text = "; ".join(constraint_violations)
+                circ_zones[0].notes += f" [SHAPE CONSTRAINT VIOLATIONS: {violations_text}]"
 
         return zones
 
@@ -436,15 +522,21 @@ class SpaceCalculator:
                     )
                     zones.append(zone)
             elif zone_type == ZoneType.PHONE_BOOTH:
-                # Each booth: 1 person, 2 sqm (fixed from ZONE_SIZING)
-                num_booths = count
-                booth_sqm = self.ZONE_SIZING[ZoneType.PHONE_BOOTH]  # Use fixed 2.0 sqm per booth
+                # Each booth: up to 2 people, 2.5 sqm per booth unit
+                # This prevents treemap from creating too many thin rectangles
+                booth_sqm = self.ZONE_SIZING[ZoneType.PHONE_BOOTH]  # 2.5 sqm per booth
+                # Create one booth per 2 people (rounded up), with total area divided evenly
+                num_booths = max(1, (count + 1) // 2)  # Ceiling division for count people
+                total_booth_area = allocated_sqm
+                sqm_per_booth = total_booth_area / num_booths if num_booths > 0 else booth_sqm
+
                 for i in range(num_booths):
+                    occupancy_in_booth = min(2, count - i*2)  # Remaining people for this booth
                     zone = Zone(
                         zone_type=zone_type.value,
                         name=f"Phone Booth {i+1}",
-                        sqm=booth_sqm,
-                        occupancy=1,
+                        sqm=sqm_per_booth,
+                        occupancy=max(1, occupancy_in_booth),  # At least 1 even if not all used
                         adjacencies=["open-space"],
                         notes="Acoustic isolation for calls"
                     )
