@@ -5,6 +5,7 @@ Exposes MCP server functionality over HTTP with:
   - OAuth 2.1 Bearer token validation
   - RFC 9728 protected resource metadata endpoint
   - Space layout generation with authentication
+  - MCP Streamable HTTP transport (JSON-RPC 2.0 over POST /mcp)
 """
 
 import json
@@ -13,13 +14,14 @@ import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, status, Depends, Request
+from fastapi import FastAPI, HTTPException, status, Depends, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from oauth_middleware import add_oauth_routes, oauth_dependency, OAuthMiddleware
 from space_calculator import generate_space_layouts_json
+from server import server as mcp_server
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -173,6 +175,181 @@ async def health_check() -> Dict[str, Any]:
         "version": "0.1.0",
         "oauth_required": require_auth
     }
+
+
+# ============================================================================
+# MCP STREAMABLE HTTP TRANSPORT (JSON-RPC 2.0 over POST)
+# ============================================================================
+
+class JsonRpcRequest(BaseModel):
+    """JSON-RPC 2.0 request."""
+    jsonrpc: str = "2.0"
+    method: str
+    params: Optional[Dict[str, Any]] = None
+    id: Optional[Any] = None
+
+
+class JsonRpcResponse(BaseModel):
+    """JSON-RPC 2.0 response."""
+    jsonrpc: str = "2.0"
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
+    id: Optional[Any] = None
+
+
+@app.post("/mcp")
+async def mcp_transport(
+    req: JsonRpcRequest,
+    request: Request,
+    token: str = Depends(oauth_dependency)
+) -> JsonRpcResponse:
+    """
+    MCP Streamable HTTP transport endpoint (JSON-RPC 2.0).
+
+    Implements MCP protocol over HTTP POST with OAuth 2.1 token validation.
+    Supports: initialize, tools/list, tools/call
+
+    Args:
+        req: JSON-RPC request
+        token: Validated OAuth bearer token
+
+    Returns:
+        JSON-RPC response with result or error
+    """
+    logger.info(f"[{token[:10] if token else 'no-auth'}...] MCP request: {req.method}")
+
+    try:
+        method = req.method
+        params = req.params or {}
+        request_id = req.id
+
+        # Route to MCP server methods
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "logging": {},
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "mcp-floorplans",
+                    "version": "0.1.0"
+                }
+            }
+            return JsonRpcResponse(result=result, id=request_id)
+
+        elif method == "tools/list":
+            # List available tools
+            result = {
+                "tools": [
+                    {
+                        "name": "generate_space_layouts",
+                        "description": "Generate workspace layout variants from brief",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "surface_sqm": {
+                                    "type": "number",
+                                    "description": "Total workspace area in square meters"
+                                },
+                                "headcount": {
+                                    "type": "integer",
+                                    "description": "Number of people to accommodate"
+                                },
+                                "zone_types": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Desired zone types"
+                                },
+                                "collaboration_style": {
+                                    "type": "string",
+                                    "description": "high_collab | medium_collab | low_collab"
+                                },
+                                "project_id": {
+                                    "type": "string",
+                                    "description": "Project identifier"
+                                }
+                            },
+                            "required": ["surface_sqm", "headcount", "zone_types"]
+                        }
+                    },
+                    {
+                        "name": "analyze_zone_adjacencies",
+                        "description": "Analyze zone proximity and adjacency metrics",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "zones": {
+                                    "type": "array",
+                                    "description": "Zone definitions"
+                                }
+                            },
+                            "required": ["zones"]
+                        }
+                    },
+                    {
+                        "name": "validate_space_brief",
+                        "description": "Validate a workspace brief for consistency",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "surface_sqm": {"type": "number"},
+                                "headcount": {"type": "integer"},
+                                "zone_types": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                }
+                            },
+                            "required": ["surface_sqm", "headcount", "zone_types"]
+                        }
+                    }
+                ]
+            }
+            return JsonRpcResponse(result=result, id=request_id)
+
+        elif method == "tools/call":
+            # Call a tool via the MCP server
+            tool_name = params.get("name")
+            tool_args = params.get("arguments", {})
+
+            if not tool_name:
+                return JsonRpcResponse(
+                    error={"code": -32602, "message": "Missing tool name"},
+                    id=request_id
+                )
+
+            try:
+                # Call tool through MCP server
+                response = await mcp_server.call_tool(tool_name, tool_args)
+                result = {
+                    "content": [
+                        {
+                            "type": c.type,
+                            "text": c.text if hasattr(c, 'text') else str(c)
+                        } for c in response.content
+                    ],
+                    "isError": response.is_error
+                }
+                return JsonRpcResponse(result=result, id=request_id)
+            except ValueError as e:
+                return JsonRpcResponse(
+                    error={"code": -32601, "message": str(e)},
+                    id=request_id
+                )
+
+        else:
+            # Unknown method
+            return JsonRpcResponse(
+                error={"code": -32601, "message": f"Unknown method: {method}"},
+                id=request_id
+            )
+
+    except Exception as e:
+        logger.error(f"MCP transport error: {e}")
+        return JsonRpcResponse(
+            error={"code": -32603, "message": f"Internal error: {str(e)}"},
+            id=req.id
+        )
 
 
 if __name__ == "__main__":

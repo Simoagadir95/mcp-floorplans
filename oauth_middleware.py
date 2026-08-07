@@ -126,51 +126,63 @@ def validate_bearer_token(request: Request) -> str:
             }
         )
 
-    # RFC 8707: Audience validation (if OAuth is configured)
+    # RFC 8707: Audience validation + signature verification (if OAuth is configured)
     if OAUTH_CONFIGURED:
         try:
             import jwt
-            from jwt import PyJWTError
+            from jwt import PyJWTError, PyJWKClient
+            from jwt.exceptions import PyJWKClientError
 
-            # Decode without verification first to get the payload
-            # (will validate signature properly once JWKS is available)
+            # Fetch JWKS from the issuer and validate signature
             try:
-                decoded = jwt.decode(token, options={"verify_signature": False})
-            except PyJWTError as e:
-                logger.warning(f"Token decode failed: {e}")
+                jwks_client = PyJWKClient(OAUTH_JWKS_URI, cache_keys=True)
+                signing_key = jwks_client.get_signing_key_from_jwt(token)
+                decoded = jwt.decode(
+                    token,
+                    key=signing_key.key,
+                    algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+                    audience=OAUTH_RESOURCE_AUDIENCE,
+                    issuer=OAUTH_ISSUER,
+                    options={"verify_signature": True}
+                )
+            except PyJWKClientError as e:
+                logger.warning(f"JWKS client error (issuer={OAUTH_ISSUER}, jwks_uri={OAUTH_JWKS_URI}): {e}")
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid token format",
-                    headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans"'}
-                )
-
-            # RFC 8707: Validate audience claim
-            token_audience = decoded.get("aud")
-            if not token_audience:
-                logger.warning(f"Token missing 'aud' claim (RFC 8707 required)")
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Token missing required 'aud' claim",
+                    detail="Token validation failed: unable to retrieve signing key",
                     headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans", error="invalid_token"'}
                 )
-
-            # Check if token audience matches this resource
-            if isinstance(token_audience, str):
-                audiences = [token_audience]
-            elif isinstance(token_audience, list):
-                audiences = token_audience
-            else:
-                audiences = []
-
-            if OAUTH_RESOURCE_AUDIENCE not in audiences:
-                logger.warning(f"Token audience mismatch: {audiences} != {OAUTH_RESOURCE_AUDIENCE}")
+            except jwt.InvalidSignatureError as e:
+                logger.warning(f"Invalid token signature: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token signature verification failed",
+                    headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans", error="invalid_token"'}
+                )
+            except jwt.InvalidAudienceError as e:
+                logger.warning(f"Token audience mismatch: {e}")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Token not valid for audience {OAUTH_RESOURCE_AUDIENCE}",
                     headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans", error="invalid_token"'}
                 )
+            except jwt.InvalidIssuerError as e:
+                logger.warning(f"Invalid token issuer: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token issuer verification failed",
+                    headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans", error="invalid_token"'}
+                )
+            except PyJWTError as e:
+                logger.warning(f"Token validation failed: {e}")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid token format or claims",
+                    headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans"'}
+                )
 
-            logger.info(f"Token validated (aud={token_audience})")
+            token_audience = decoded.get("aud")
+            logger.info(f"Token validated (iss={decoded.get('iss')}, aud={token_audience})")
         except HTTPException:
             raise
         except Exception as e:
@@ -181,8 +193,13 @@ def validate_bearer_token(request: Request) -> str:
                 headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans"'}
             )
     else:
-        # Dev mode: no OAuth server, accept any Bearer token
-        logger.debug(f"Dev mode: accepting token without validation")
+        # No OAuth configured: FAIL CLOSED
+        logger.error("D3 BLOCKED: OAuth not configured. Refusing all requests.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OAuth configuration required. D3 transport not operational.",
+            headers={"Retry-After": "300"}
+        )
 
     logger.info(f"Token accepted: {token[:10]}...")
     return token
