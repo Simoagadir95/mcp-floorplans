@@ -20,6 +20,7 @@ metadata but accepts any Bearer token (development mode only).
 import json
 import logging
 import os
+import secrets
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, status, Depends
 from fastapi.responses import JSONResponse, Response
@@ -197,7 +198,8 @@ def validate_bearer_token(request: Request) -> str:
     elif DEVELOPMENT_MODE:
         # Development mode: validate against DEVELOPMENT_MODE_TOKEN (must match exactly)
         # This is intended ONLY for testing and should never be used in production
-        if token != DEVELOPMENT_MODE_TOKEN:
+        # Use constant-time comparison to prevent timing attacks
+        if not secrets.compare_digest(token, DEVELOPMENT_MODE_TOKEN):
             logger.warning(f"Development mode: token mismatch (provided != configured)")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -333,6 +335,9 @@ class OAuthMiddleware:
 
             if not auth_header or not auth_header.startswith("Bearer "):
                 # Return 401 without proceeding
+                # RFC 9728: include resource_metadata pointing to PRM URI
+                prm_uri = f"http://{scope.get('server', ['localhost', 8851])[0]}:{scope.get('server', ['localhost', 8851])[1]}/.well-known/oauth-protected-resource"
+                www_auth_header = f'Bearer realm="mcp-floorplans", resource_metadata="{prm_uri}"'
                 await send({
                     "type": "http.response.start",
                     "status": 401,
@@ -340,7 +345,7 @@ class OAuthMiddleware:
                         [b"content-type", b"application/json"],
                         [
                             b"www-authenticate",
-                            f'Bearer realm="Space Designer"'.encode()
+                            www_auth_header.encode()
                         ]
                     ]
                 })
