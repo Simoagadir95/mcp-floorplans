@@ -31,12 +31,14 @@ logger = logging.getLogger(__name__)
 OAUTH_ISSUER = os.getenv("OAUTH_ISSUER")
 OAUTH_JWKS_URI = os.getenv("OAUTH_JWKS_URI")
 OAUTH_RESOURCE_AUDIENCE = os.getenv("OAUTH_RESOURCE_AUDIENCE", "urn:virtus:mcp-floorplans")
+DEVELOPMENT_MODE_TOKEN = os.getenv("DEVELOPMENT_MODE_TOKEN")  # For testing only: shared token
 
-# Flag: if no issuer/JWKS configured, D3 is in BLOCKED/dev mode
+# Flag: if no issuer/JWKS configured, check for development mode token
 OAUTH_CONFIGURED = bool(OAUTH_ISSUER and OAUTH_JWKS_URI)
+DEVELOPMENT_MODE = bool(DEVELOPMENT_MODE_TOKEN) and not OAUTH_CONFIGURED
 
-if not OAUTH_CONFIGURED:
-    logger.warning("D3 BLOCKED: No OAuth server configured. Set OAUTH_ISSUER and OAUTH_JWKS_URI to enable.")
+if not OAUTH_CONFIGURED and not DEVELOPMENT_MODE:
+    logger.warning("D3 BLOCKED: No OAuth server configured. Set OAUTH_ISSUER/OAUTH_JWKS_URI for production, or DEVELOPMENT_MODE_TOKEN for development.")
 
 # OAuth 2.1 Protected Resource Metadata (RFC 9728 compliant)
 # This is served at /.well-known/oauth-protected-resource
@@ -192,12 +194,30 @@ def validate_bearer_token(request: Request) -> str:
                 detail="Token validation failed",
                 headers={"WWW-Authenticate": f'Bearer realm="mcp-floorplans"'}
             )
+    elif DEVELOPMENT_MODE:
+        # Development mode: validate against DEVELOPMENT_MODE_TOKEN (must match exactly)
+        # This is intended ONLY for testing and should never be used in production
+        if token != DEVELOPMENT_MODE_TOKEN:
+            logger.warning(f"Development mode: token mismatch (provided != configured)")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token (development mode)",
+                headers={
+                    "WWW-Authenticate": f'Bearer realm="mcp-floorplans", error="invalid_token"'
+                }
+            )
+        logger.info(f"Token accepted (development mode): {token[:20]}...")
     else:
-        # No OAuth configured: DEV MODE
-        # Accept Bearer token without validation (still requires Authorization header)
-        # Production: Configure OAUTH_ISSUER and OAUTH_JWKS_URI for full validation
-        logger.warning("D3 DEV MODE: OAuth not configured. Accepting all Bearer tokens without validation.")
-        logger.info(f"Token accepted (dev mode, unvalidated): {token[:20]}...")
+        # No OAuth configured and no development token: FAIL-CLOSED
+        # Refuse all requests without proper OAuth validation
+        logger.error("D3 FAIL-CLOSED: OAuth not configured. Cannot validate tokens. Service requires OAuth configuration or DEVELOPMENT_MODE_TOKEN.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OAuth configuration required. Set OAUTH_ISSUER + OAUTH_JWKS_URI (production) or DEVELOPMENT_MODE_TOKEN (development).",
+            headers={
+                "WWW-Authenticate": f'Bearer realm="mcp-floorplans", error="unauthorized_client"'
+            }
+        )
 
     logger.info(f"Token accepted: {token[:10]}...")
     return token

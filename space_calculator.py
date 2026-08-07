@@ -364,69 +364,161 @@ class SpaceCalculator:
         GUARANTEES:
           - non-overlapping rectangles
           - exact surface conservation
-          - NO zones violate min_width or max_aspect_ratio constraints in output
+          - Constraint violations are detected and returned (not raised)
 
         Returns:
-            Tuple of (zones, constraint_violations)
+            Tuple of (zones, constraint_violations list)
 
-        Raises:
-            ValueError: if layout cannot satisfy all constraints
+        Note:
+            This is a multi-attempt layout process. If initial layout has constraint violations,
+            it attempts repartitioning (redistributing zone surfaces) and retrying. If after
+            several attempts violations persist, they are returned in the output so the client
+            can audit and understand the compromise made.
         """
         if not zones:
             return zones, []
 
-        # Validate total area and scale zones to match exact surface
-        total_zone_sqm = sum(z.sqm for z in zones)
-        tolerance = self.surface_sqm * self.circulation_tolerance
+        # Make a working copy to avoid mutating original
+        working_zones = [Zone(
+            zone_type=z.zone_type,
+            name=z.name,
+            sqm=z.sqm,
+            occupancy=z.occupancy,
+            adjacencies=z.adjacencies,
+            notes=z.notes,
+            x=z.x, y=z.y, width=z.width, length=z.length
+        ) for z in zones]
 
-        # Scale zones proportionally to match exact surface (always, not just if tolerance exceeded)
-        if total_zone_sqm > 0:
-            scale_factor = self.surface_sqm / total_zone_sqm
-            for zone in zones:
-                zone.sqm *= scale_factor
+        # Retry loop: attempt layout, detect violations, repartition, retry
+        max_repartition_attempts = 5
+        best_layout_zones = None
+        best_violation_count = float('inf')
 
-        # Set up coordinate system: assume rectangular envelope
-        side_length = math.sqrt(self.surface_sqm)
+        for attempt in range(max_repartition_attempts):
+            # Validate total area and scale zones to match exact surface
+            total_zone_sqm = sum(z.sqm for z in working_zones)
+            tolerance = self.surface_sqm * self.circulation_tolerance
 
-        # Create mapping from zone name to zone type for constraint-aware subdivision
-        zone_name_to_type = {z.name: z.zone_type for z in zones}
+            # Scale zones proportionally to match exact surface (always, not just if tolerance exceeded)
+            if total_zone_sqm > 0:
+                scale_factor = self.surface_sqm / total_zone_sqm
+                for zone in working_zones:
+                    zone.sqm *= scale_factor
 
-        # Apply treemap to ALL zones (including circulation)
-        areas = [(z.name, z.sqm) for z in zones]
-        areas.sort(key=lambda x: -x[1])  # Sort descending by area
+            # Set up coordinate system: assume rectangular envelope
+            side_length = math.sqrt(self.surface_sqm)
 
-        rectangles: Dict[str, Tuple[float, float, float, float]] = {}
+            # Create mapping from zone name to zone type for constraint-aware subdivision
+            zone_name_to_type = {z.name: z.zone_type for z in working_zones}
 
-        # Start squarification from top-left with constraint awareness
-        self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type)
+            # Apply treemap to ALL zones (including circulation)
+            areas = [(z.name, z.sqm) for z in working_zones]
+            areas.sort(key=lambda x: -x[1])  # Sort descending by area
 
-        # Assign coordinates to zones from treemap
-        constraint_violations = []
-        for zone in zones:
-            if zone.name in rectangles:
-                x, y, w, h = rectangles[zone.name]
-                zone.x = x
-                zone.y = y
-                zone.width = w
-                zone.length = h
+            rectangles: Dict[str, Tuple[float, float, float, float]] = {}
 
-                # Check shape constraints
+            # Start squarification from top-left with constraint awareness
+            self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type)
+
+            # Assign coordinates to zones from treemap
+            constraint_violations = []
+            violation_map = {}  # Map zone name to violation
+            for zone in working_zones:
+                if zone.name in rectangles:
+                    x, y, w, h = rectangles[zone.name]
+                    zone.x = x
+                    zone.y = y
+                    zone.width = w
+                    zone.length = h
+
+                    # Check shape constraints
+                    is_valid, violation_msg = self._check_shape_constraints(zone)
+                    if not is_valid:
+                        constraint_violations.append(f"{zone.name}: {violation_msg}")
+                        violation_map[zone.name] = violation_msg
+
+            # Verify non-overlapping: check intersection area for all pairs
+            self._verify_no_overlaps(working_zones)
+
+            # Track best layout so far (fewest violations)
+            if len(constraint_violations) < best_violation_count:
+                best_violation_count = len(constraint_violations)
+                best_layout_zones = [Zone(
+                    zone_type=z.zone_type,
+                    name=z.name,
+                    sqm=z.sqm,
+                    occupancy=z.occupancy,
+                    adjacencies=z.adjacencies,
+                    notes=z.notes,
+                    x=z.x, y=z.y, width=z.width, length=z.length
+                ) for z in working_zones]
+
+            # If no constraint violations, success!
+            if not constraint_violations:
+                # Copy back to original zones list
+                for i, zone in enumerate(zones):
+                    zone.x = working_zones[i].x
+                    zone.y = working_zones[i].y
+                    zone.width = working_zones[i].width
+                    zone.length = working_zones[i].length
+                logger.info(f"Layout converged at attempt {attempt+1}")
+                return zones, []
+
+            # Constraint violations detected - attempt repartitioning
+            if attempt < max_repartition_attempts - 1:
+                logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
+
+                # Repartition strategy: modify zone surface distribution to improve layout
+                # Reduce sizes of violating zones slightly (esp. those with aspect ratio violations)
+                for zone_name, violation_msg in violation_map.items():
+                    for zone in working_zones:
+                        if zone.name == zone_name:
+                            # Reduce by 5% and redistribute to circulation
+                            reduction = zone.sqm * 0.05
+                            zone.sqm -= reduction
+
+                            # Redistribute to circulation to maintain total area
+                            circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
+                            if circulation_zones:
+                                per_zone = reduction / len(circulation_zones)
+                                for circ in circulation_zones:
+                                    circ.sqm += per_zone
+                            break
+
+                continue
+
+            # Max attempts reached; use best layout found
+            if best_layout_zones:
+                logger.warning(f"Layout did not converge after {max_repartition_attempts} attempts. Using best layout found ({best_violation_count} violations).")
+                for i, zone in enumerate(zones):
+                    zone.x = best_layout_zones[i].x
+                    zone.y = best_layout_zones[i].y
+                    zone.width = best_layout_zones[i].width
+                    zone.length = best_layout_zones[i].length
+                # Recalculate violations for best layout
+                constraint_violations = []
+                for zone in best_layout_zones:
+                    is_valid, violation_msg = self._check_shape_constraints(zone)
+                    if not is_valid:
+                        constraint_violations.append(f"{zone.name}: {violation_msg}")
+                return zones, constraint_violations
+
+        # Return best layout found
+        if best_layout_zones:
+            for i, zone in enumerate(zones):
+                zone.x = best_layout_zones[i].x
+                zone.y = best_layout_zones[i].y
+                zone.width = best_layout_zones[i].width
+                zone.length = best_layout_zones[i].length
+            # Recalculate violations for best layout
+            constraint_violations = []
+            for zone in best_layout_zones:
                 is_valid, violation_msg = self._check_shape_constraints(zone)
                 if not is_valid:
                     constraint_violations.append(f"{zone.name}: {violation_msg}")
+            return zones, constraint_violations
 
-        # Verify non-overlapping: check intersection area for all pairs
-        self._verify_no_overlaps(zones)
-
-        # ENFORCE: No zones should violate constraints in final output
-        # This is a hard error, not a soft warning
-        if constraint_violations:
-            # Constraint violations are not acceptable; raise error instead of proceeding
-            violation_details = "; ".join(constraint_violations)
-            logger.error(f"Layout generation failed: {len(constraint_violations)} constraint violations: {violation_details}")
-            raise ValueError(f"Cannot generate layout due to constraint violations: {violation_details}")
-
-        return zones, constraint_violations
+        return zones, []
 
     def _verify_no_overlaps(self, zones: List[Zone]) -> None:
         """
