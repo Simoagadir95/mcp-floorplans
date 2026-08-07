@@ -83,7 +83,7 @@ def validate_bearer_token(request: Request) -> str:
     if not auth_header:
         # No auth header — return 401 with WWW-Authenticate pointing to PRM URI
         # RFC 9728: resource_metadata should be a URI, not inline JSON
-        prm_uri = f"{request.base_url.rstrip('/')}/.well-known/oauth-protected-resource"
+        prm_uri = f"{str(request.base_url).rstrip('/')}/.well-known/oauth-protected-resource"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authorization required",
