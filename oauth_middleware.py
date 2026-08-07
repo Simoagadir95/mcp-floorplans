@@ -242,12 +242,19 @@ async def oauth_dependency(request: Request) -> str:
     """
     FastAPI dependency for OAuth 2.1 token validation.
 
+    If REQUIRE_OAUTH=false, returns empty string (no validation).
+    If REQUIRE_OAUTH=true (default), validates Bearer token and raises 401 on failure.
+
     Usage:
         @app.post("/generate")
         async def generate(request: GenerateRequest, token: str = Depends(oauth_dependency)):
-            # token is the validated Bearer token
+            # token is the validated Bearer token (or empty string if auth not required)
             ...
     """
+    if not os.getenv("REQUIRE_OAUTH", "true").lower() == "true":
+        # Auth not required; return empty token
+        return ""
+
     return validate_bearer_token(request)
 
 
