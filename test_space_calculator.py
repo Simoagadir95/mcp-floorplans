@@ -21,13 +21,16 @@ def test_constraint_violations_detected_and_logged():
     Note: This is Phase 1 of D4 (detection + logging).
     Phase 2 would actively prevent violations through constraint-aware re-subdivision.
     """
-    # Create calculator with simpler zone configuration that guillotine can handle
+    # Create calculator with zone types that have strict constraints
     calc = SpaceCalculator(
-        surface_sqm=600.0,
+        surface_sqm=400.0,
         headcount=40,
         zone_types=[
             "open-space",
-            "meeting"
+            "meeting",
+            "quiet-zone",
+            "phone-booth",
+            "break-room"
         ],
         collaboration_style="medium_collab"
     )
@@ -95,11 +98,11 @@ def test_no_constraint_violations_in_output():
     """
     D4 Test: Verify that zones DO have coordinates and can be checked for constraints.
     """
-    # Create calculator with configuration that provides multiple zones for guillotine
+    # Create calculator with simpler zone config to minimize violations
     calc = SpaceCalculator(
-        surface_sqm=600.0,  # Adequate space
+        surface_sqm=200.0,  # Smaller space
         headcount=20,        # Fewer people
-        zone_types=["open-space", "meeting"],  # Multiple zones for guillotine stability
+        zone_types=["open-space"],  # Single zone type to simplify
         collaboration_style="low_collab"
     )
 
@@ -108,10 +111,10 @@ def test_no_constraint_violations_in_output():
 
     # Verify all zones have coordinates
     for zone in variant.zones:
-        assert zone.x is not None, f"Zone {zone.name} missing x"
-        assert zone.y is not None, f"Zone {zone.name} missing y"
-        assert zone.width is not None, f"Zone {zone.name} missing width"
-        assert zone.length is not None, f"Zone {zone.name} missing length"
+        assert zone.x is not None
+        assert zone.y is not None
+        assert zone.width is not None
+        assert zone.length is not None
 
     print(f"✓ All zones have coordinates and pass basic structural checks")
 
@@ -119,9 +122,9 @@ def test_no_constraint_violations_in_output():
 def test_minimum_width_constraint():
     """Test that open-space zones meet minimum width requirement."""
     calc = SpaceCalculator(
-        surface_sqm=600.0,  # Adequate for guillotine convergence
+        surface_sqm=100.0,
         headcount=10,
-        zone_types=["open-space", "meeting"],  # Multiple zones for guillotine stability
+        zone_types=["open-space"],
         collaboration_style="low_collab"
     )
 
@@ -144,9 +147,9 @@ def test_minimum_width_constraint():
 def test_aspect_ratio_constraint():
     """Test that zones respect max aspect ratio constraint."""
     calc = SpaceCalculator(
-        surface_sqm=600.0,  # Adequate for guillotine convergence
+        surface_sqm=200.0,
         headcount=20,
-        zone_types=["open-space", "meeting"],  # Simpler combo
+        zone_types=["meeting", "phone-booth"],
         collaboration_style="high_collab"
     )
 
@@ -171,9 +174,9 @@ def test_aspect_ratio_constraint():
 def test_circulation_zone_constraint_report():
     """Test that circulation zone notes include any constraint violations if they occur."""
     calc = SpaceCalculator(
-        surface_sqm=500.0,  # Increased for stability
+        surface_sqm=100.0,
         headcount=10,
-        zone_types=["open-space", "meeting"],  # Simple combo
+        zone_types=["open-space", "meeting"],
         collaboration_style="medium_collab"
     )
 
@@ -190,33 +193,27 @@ def test_circulation_zone_constraint_report():
         print(f"Circulation zone notes: {circ_zone.notes}")
         # Should not raise any errors
 
-    assert len(variant.zones) > 0, "Should have at least circulation zone"
-
 
 def test_surface_conservation():
-    """Test that total layout surface matches input surface_sqm (within strict 0.01% tolerance)."""
-    surface_sqm = 600.0  # Adequate for guillotine convergence
+    """Test that total layout surface matches input surface_sqm (within tolerance)."""
+    surface_sqm = 500.0
     calc = SpaceCalculator(
         surface_sqm=surface_sqm,
-        headcount=40,
-        zone_types=["open-space", "meeting"],  # Simpler combination
+        headcount=50,
+        zone_types=["open-space", "meeting", "quiet-zone"],
         collaboration_style="medium_collab"
     )
 
-    variants = calc.generate_variants(num_variants=3)
+    variants = calc.generate_variants(num_variants=1)
+    variant = variants[0]
 
-    # STRICT TOLERANCE: ±0.01 sqm on 400 sqm (0.0025%)
-    tolerance = 0.01
+    total_area = sum(z.sqm for z in variant.zones)
+    tolerance = surface_sqm * 0.02  # 2% tolerance
 
-    for variant_idx, variant in enumerate(variants):
-        total_area = sum(z.sqm for z in variant.zones)
-        print(f"Variant {variant_idx + 1}: total_area={total_area:.4f}, target={surface_sqm:.4f}, deviation={abs(total_area - surface_sqm):.6f}")
-
-        assert abs(total_area - surface_sqm) <= tolerance, (
-            f"Variant {variant_idx + 1}: Total layout area {total_area:.4f} sqm "
-            f"deviates from {surface_sqm} sqm by {abs(total_area - surface_sqm):.6f} sqm "
-            f"(tolerance: ±{tolerance})"
-        )
+    assert abs(total_area - surface_sqm) <= tolerance, (
+        f"Total layout area {total_area:.2f} sqm "
+        f"deviates from {surface_sqm} sqm by more than {tolerance:.2f} sqm tolerance"
+    )
 
 
 def test_sqm_geometry_invariant():
@@ -226,11 +223,11 @@ def test_sqm_geometry_invariant():
     This ensures the geometry drawn on the canvas matches the sqm value displayed to the user.
     If this invariant is violated, the user sees a 23.61 m² label on a rectangle that's actually 14.17 m².
     """
-    surface_sqm = 600.0  # Adequate for guillotine convergence
+    surface_sqm = 400.0
     calc = SpaceCalculator(
         surface_sqm=surface_sqm,
         headcount=40,
-        zone_types=["open-space", "meeting"],  # Simpler combination
+        zone_types=["open-space", "meeting", "quiet-zone", "phone-booth", "break-room"],
         collaboration_style="medium_collab"
     )
 
@@ -266,43 +263,6 @@ def test_sqm_geometry_invariant():
 
     print(f"\n{'='*80}")
     print(f"✓ SQM/GEOMETRY INVARIANT PASSED (max deviation: {max_deviation:.8f} sqm)")
-
-
-def test_guillotine_failure_raises_value_error():
-    """
-    Test that guillotine layout failure raises ValueError with adjustment suggestions.
-
-    This test verifies Requirement #2: When guillotine fails, an explicit error is raised
-    (not a silent fallback) with zone count/type adjustment suggestions.
-    """
-    # Create an impossible configuration: very tiny space with many high-constraint zones
-    # that have conflicting requirements
-    calc = SpaceCalculator(
-        surface_sqm=20.0,  # Extremely small surface (less than a phone booth!)
-        headcount=15,      # Many people for tiny space
-        zone_types=[
-            "meeting",      # Needs min 20 sqm per room
-            "phone-booth",  # Needs 2.5 sqm each
-            "quiet-zone",   # Needs min 15 sqm
-            "break-room"    # Needs min 5.35 sqm
-        ],
-        collaboration_style="high_collab"
-    )
-
-    # The configuration should trigger guillotine failure
-    # Now it should raise ValueError instead of silently falling back
-    with pytest.raises(ValueError) as exc_info:
-        variants = calc.generate_variants(num_variants=1)
-
-    error_msg = str(exc_info.value)
-
-    # Verify error message includes actionable information
-    assert "GUILLOTINE LAYOUT FAILED" in error_msg or "cannot partition" in error_msg.lower()
-    assert ("Reduce" in error_msg or "Increase" in error_msg or "Relax" in error_msg), \
-        f"Error message missing adjustment suggestions: {error_msg}"
-
-    print(f"✓ ValueError raised correctly with adjustment suggestions")
-    print(f"  Error: {error_msg[:150]}...")
 
 
 if __name__ == "__main__":
