@@ -209,13 +209,46 @@ class SpaceCalculator:
             # If all left zones are phone booths (or similar small zones), prefer horizontal cut to keep them narrow
             if left_types <= {"phone-booth"}:
                 cut_height = height * proportion
-                self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
+                # Ensure cut respects container constraints
+                if cut_height > 0 and (height - cut_height) > 0:
+                    self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
+                    self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
+                else:
+                    # Fallback to standard cut
+                    min_dimension = 1.0
+                    if width >= height:
+                        cut_width = max(min_dimension, width * proportion)
+                        cut_width = min(cut_width, width - min_dimension)
+                        self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
+                        self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
+                    else:
+                        cut_height = max(min_dimension, height * proportion)
+                        cut_height = min(cut_height, height - min_dimension)
+                        self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
+                        self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
                 return
 
         # Standard logic: prefer cut perpendicular to longest side
-        # Constraint-aware: enforce minimum dimensions to prevent violations
+        # Constraint-aware: try to place zones with constraints in locations that allow better proportions
         min_dimension = 1.0  # Minimum 1m dimension for any rectangle
+
+        # Check if we have constraint-heavy zones (those with tight min_width or aspect ratio)
+        if zone_name_to_type:
+            left_types = {zone_name_to_type.get(name, "unknown") for name, _ in left_areas}
+            # Zones that need wider proportions: quiet-zone, break-room, etc.
+            width_intensive = {"quiet-zone", "break-room", "meeting"}
+            has_width_intensive_left = bool(left_types & width_intensive)
+
+            if has_width_intensive_left and width < height:
+                # Width-intensive zones on left, but container is taller than wide
+                # Use VERTICAL cut to give left group (width-intensive) more horizontal space
+                cut_width = max(min_dimension, width * proportion)
+                cut_width = min(cut_width, width - min_dimension)
+                if cut_width > min_dimension and (width - cut_width) > min_dimension:
+                    self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
+                    self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
+                    return
+                # Fall through to standard logic if cut doesn't work
 
         if width >= height:
             # Vertical cut (split along width) — prefer for wider containers
@@ -418,28 +451,53 @@ class SpaceCalculator:
         best_layout_zones = None
         best_violation_count = float('inf')
 
+        # Track minimum areas required for each zone to satisfy constraints
+        min_areas_required = {}
+        min_areas_total = 0
+        for zone in working_zones:
+            min_area = self._calculate_minimum_area_for_constraints(ZoneType(zone.zone_type))
+            if min_area > 0:
+                min_areas_required[zone.name] = min_area
+                # Ensure zone has at least minimum area
+                if zone.sqm < min_area:
+                    logger.info(f"Zone {zone.name} ({zone.zone_type}): allocated {zone.sqm:.1f} sqm but needs minimum {min_area:.1f} sqm. Increasing to minimum.")
+                    zone.sqm = min_area
+                min_areas_total += min_area
+            else:
+                min_areas_total += zone.sqm
+
+        # Verify minimum areas fit within total surface
+        if min_areas_total > self.surface_sqm:
+            logger.critical(f"Minimum area constraints ({min_areas_total:.1f} sqm) exceed total surface ({self.surface_sqm} sqm). This is IMPOSSIBLE to satisfy.")
+            # Still proceed - will give best effort
+
         for attempt in range(max_repartition_attempts):
             # Validate total area and scale zones to match exact surface
             total_zone_sqm = sum(z.sqm for z in working_zones)
             tolerance = self.surface_sqm * self.circulation_tolerance
 
-            # DEFECT E FIX: Don't scale FIXED-SIZE zones (like phone booths)
+            # DEFECT E FIX: Don't scale FIXED-SIZE zones (like phone booths) or MINIMUM-CONSTRAINED zones
             # Scale only elastic zones proportionally to match exact surface
+            # CRITICAL: Respect min_areas_required - never scale below minimum
             if total_zone_sqm > 0:
-                # Separate fixed and elastic zones
-                phone_booth_zones = [z for z in working_zones if z.zone_type == "phone-booth"]
-                elastic_zones = [z for z in working_zones if z.zone_type != "phone-booth"]
+                # Separate fixed, minimum-constrained, and truly elastic zones
+                fixed_zones = [z for z in working_zones if z.zone_type == "phone-booth"]
+                constrained_zones = [z for z in working_zones if z.name in min_areas_required and z.zone_type != "phone-booth"]
+                elastic_zones = [z for z in working_zones if z.zone_type == "circulation" and z.name not in min_areas_required]
 
-                # Calculate totals
-                booth_sqm = sum(z.sqm for z in phone_booth_zones)
+                # Calculate totals BEFORE any scaling
+                fixed_sqm = sum(z.sqm for z in fixed_zones)
+                constrained_sqm = sum(z.sqm for z in constrained_zones)
                 elastic_sqm = sum(z.sqm for z in elastic_zones)
 
-                # Scale elastic zones only
+                # Only scale elastic zones, preserve fixed and constrained
                 if elastic_sqm > 0:
-                    scale_factor = (self.surface_sqm - booth_sqm) / elastic_sqm
+                    target_elastic = max(0, self.surface_sqm - fixed_sqm - constrained_sqm)
+                    scale_factor = target_elastic / elastic_sqm if elastic_sqm > 0 else 1.0
                     for zone in elastic_zones:
                         zone.sqm *= scale_factor
-                # Keep phone booth zones as-is (no scaling)
+                        logger.info(f"  Scaled {zone.name} to {zone.sqm:.1f} sqm")
+                # Keep fixed and constrained zones as-is (no scaling)
 
             # Set up coordinate system: assume rectangular envelope
             side_length = math.sqrt(self.surface_sqm)
@@ -489,17 +547,26 @@ class SpaceCalculator:
                 # DEFECT E: For phone booth zones, scale geometry back to FIXED target size (2.5 sqm per booth)
                 # The treemap gave them larger rectangles to fit geometric constraints
                 # Now shrink them back to realistic size (1.5-2.5 sqm each)
+                # CRITICAL: Ensure min_width 1.0m constraint is respected
                 phone_booth_size = self.ZONE_SIZING[ZoneType.PHONE_BOOTH]  # 2.5 sqm per booth (FIXED)
-                logger.info(f"DEFECT E FIX: Scaling {len(fixed_zone_objs)} phone booth zones back to {phone_booth_size} sqm each")
+                phone_booth_min_width = self.SHAPE_CONSTRAINTS[ZoneType.PHONE_BOOTH].get("min_width", 1.0)
+                logger.info(f"DEFECT E FIX: Scaling {len(fixed_zone_objs)} phone booth zones back to {phone_booth_size} sqm each (min_width={phone_booth_min_width}m)")
                 for zone in fixed_zone_objs:
                     current_area = zone.width * zone.length
                     target_sqm = phone_booth_size  # FIXED: always 2.5 sqm per phone booth
                     if current_area > 0 and target_sqm > 0:
-                        # Scale width and length proportionally to match target area
-                        scale_factor = math.sqrt(target_sqm / current_area)
+                        # Ensure width is at least min_width (1.0m for phone booths)
+                        # If current width is less than min_width, preserve it; otherwise scale proportionally
+                        short_side = min(zone.width, zone.length)
+                        long_side = max(zone.width, zone.length)
+
+                        # Force minimum width and compute depth accordingly
+                        new_width = max(phone_booth_min_width, short_side)
+                        new_length = target_sqm / new_width if new_width > 0 else long_side
+
                         old_width, old_length, old_sqm = zone.width, zone.length, zone.sqm
-                        zone.width *= scale_factor
-                        zone.length *= scale_factor
+                        zone.width = new_width
+                        zone.length = new_length
                         zone.sqm = target_sqm  # Enforce FIXED size
                         logger.info(f"  {zone.name}: {old_width:.2f}m x {old_length:.2f}m ({old_sqm:.1f} sqm) -> {zone.width:.2f}m x {zone.length:.2f}m ({zone.sqm:.1f} sqm)")
 
@@ -534,7 +601,10 @@ class SpaceCalculator:
             constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in violation_map.items()]
 
             # Verify non-overlapping: check intersection area for all pairs
-            self._verify_no_overlaps(working_zones)
+            has_overlaps, overlap_list = self._verify_no_overlaps(working_zones)
+            if has_overlaps:
+                logger.info(f"Layout attempt {attempt+1}: {len(overlap_list)} overlaps detected")
+                constraint_violations.extend([f"OVERLAP: {z1} and {z2} ({area:.4f} sqm)" for z1, z2, area in overlap_list])
 
             # Track best layout so far (fewest violations)
             if len(constraint_violations) < best_violation_count:
@@ -569,47 +639,46 @@ class SpaceCalculator:
             if attempt < max_repartition_attempts - 1:
                 logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
 
-                # Repartition strategy: aggressively reduce violating zones to enable better layout
-                # Key insight: aspect ratio violations occur when zones are squeezed into thin/tall rectangles
-                # Solution: reduce their area so treemap has flexibility to place them with better proportions
+                # Repartition strategy: redistribute area from non-violating zones to violating zones
+                # to give violating zones more flexibility in the treemap
+                # Key insight: If a zone violates min_width, it needs either more area or fewer zones in its partition
                 has_aspect_violation = any("aspect ratio" in msg for msg in violation_map.values())
                 has_width_violation = any("Min width" in msg for msg in violation_map.values())
+                has_overlap_violation = any("OVERLAP" in msg for msg in constraint_violations)
 
+                # Strategy: ABSOLUTELY enforce minimum area constraints
+                # For violating zones: INCREASE area to give them more placement flexibility
+                # NEVER reduce any zone below its minimum required area
+                total_increase_needed = 0
                 for zone_name, violation_msg in violation_map.items():
                     for zone in working_zones:
                         if zone.name == zone_name:
                             # DEFECT E FIX: Phone booths are FIXED SIZE (2.5 sqm per booth)
                             # Do NOT repartition phone booths — they maintain their size
-                            # If they violate shape constraints, accept it as a known limitation
                             if zone.zone_type == "phone-booth":
-                                # Skip repartitioning for phone booths
                                 continue
 
-                            if "aspect ratio" in violation_msg:
-                                # AGGRESSIVE: aspect ratio violations = extreme squeeze problem
-                                # Reduce by 50-70% to force much better proportions
-                                reduction = zone.sqm * (0.50 + 0.20 * (attempt / max_repartition_attempts))
-                            elif "Min width" in violation_msg:
-                                # Width violations: VERY AGGRESSIVE - reduce by 40-60% to force wider placement
-                                # Narrowness suggests zone is too large for its constraints
-                                reduction = zone.sqm * (0.40 + 0.20 * (attempt / max_repartition_attempts))
-                            else:
-                                # Other violations: reduce by 30-40%
-                                reduction = zone.sqm * (0.30 + 0.10 * (attempt / max_repartition_attempts))
+                            min_required = min_areas_required.get(zone.name, 0)
 
-                            zone.sqm = max(zone.sqm * 0.3, zone.sqm - reduction)  # Never reduce below 30% of original
-
-                            # Redistribute to circulation to maintain total area
-                            circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
-                            if circulation_zones:
-                                per_zone = reduction / len(circulation_zones)
-                                for circ in circulation_zones:
-                                    circ.sqm += per_zone
+                            # Strategy: ALL violations warrant INCREASING the violating zone's area
+                            # More sqm gives treemap more flexibility to place it properly
+                            if zone.sqm < min_required * 1.5:
+                                increase = (min_required * 1.5) - zone.sqm
+                                zone.sqm += increase
+                                total_increase_needed += increase
+                                logger.info(f"  ENFORCING MIN: {zone.name} {zone.zone_type} increased to {zone.sqm:.1f} sqm (min_required: {min_required:.1f}), reason: {violation_msg[:40]}")
                             break
 
-                # Reordering: violating zones should be placed earlier (larger zones first allows better fit)
-                # This changes the treemap hierarchy to give violating zones priority in placement
-                if has_aspect_violation or has_width_violation:
+                # Rebalance: take from circulation if we increased violating zones
+                if total_increase_needed > 0:
+                    circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
+                    if circulation_zones:
+                        per_zone = total_increase_needed / len(circulation_zones)
+                        for circ in circulation_zones:
+                            circ.sqm = max(circ.sqm - per_zone, 0)  # Never go negative
+
+                # Reordering: width-violating zones should be placed earlier (priority in treemap)
+                if has_width_violation:
                     # Separate violating and non-violating zones
                     violating_names = set(violation_map.keys())
                     non_violating = [z for z in working_zones if z.name not in violating_names]
@@ -621,6 +690,7 @@ class SpaceCalculator:
                     non_violating.sort(key=lambda z: -z.sqm)  # Larger first
 
                     working_zones = violating + non_violating
+                    logger.info(f"  Reordered zones: {[z.name for z in violating]} first")
 
                 continue
 
@@ -675,11 +745,15 @@ class SpaceCalculator:
 
         return zones, []
 
-    def _verify_no_overlaps(self, zones: List[Zone]) -> None:
+    def _verify_no_overlaps(self, zones: List[Zone]) -> Tuple[bool, List[Tuple[str, str, float]]]:
         """
-        Verify no zones overlap. Raises assertion if overlaps found.
-        Used to catch geometric errors in treemap output.
+        Verify no zones overlap. Returns list of overlaps found.
+        Used to detect and report geometric errors in treemap output.
+
+        Returns:
+            Tuple of (has_overlaps, list of (zone1_name, zone2_name, overlap_area))
         """
+        overlaps = []
         for i in range(len(zones)):
             for j in range(i+1, len(zones)):
                 z1 = zones[i]
@@ -697,9 +771,10 @@ class SpaceCalculator:
                     overlap_area = (x_right - x_left) * (y_bottom - y_top)
                     tolerance = 0.01  # Allow tiny numerical errors (< 1cm²)
                     if overlap_area > tolerance:
-                        # Log but continue — we'll report in metrics
-                        # Later cycles can address persistent overlaps
-                        pass
+                        overlaps.append((z1.name, z2.name, overlap_area))
+                        logger.warning(f"OVERLAP DETECTED: {z1.name} ({z1.zone_type}) and {z2.name} ({z2.zone_type}) overlap {overlap_area:.4f} sqm")
+
+        return len(overlaps) > 0, overlaps
 
     def _row_pack_zones_deterministic(self, zones: List[Zone], container_size: float) -> List[Dict]:
         """
@@ -882,19 +957,25 @@ class SpaceCalculator:
         # Recalculate total with adjusted allocations and rescale everything proportionally
         new_non_booth_total = sum(v for k, v in zone_allocations.items() if k != ZoneType.PHONE_BOOTH)
         if new_non_booth_total > remaining_usable:
-            # Allocations exceed available space - scale back down proportionally
-            scale_down = remaining_usable / new_non_booth_total if new_non_booth_total > 0 else 1.0
-            logger.warning(f"Minimum area constraints total {new_non_booth_total:.1f} sqm exceeds available {remaining_usable:.1f} sqm. Scaling down by {scale_down:.3f}")
-            for zone_type in zone_allocations:
-                if zone_type != ZoneType.PHONE_BOOTH:
-                    # Reduce but don't go below minimum
-                    new_allocation = zone_allocations[zone_type] * scale_down
-                    min_constraint = min_areas.get(zone_type, 0)
-                    if min_constraint > 0 and new_allocation < min_constraint:
-                        # Keep at minimum, will be handled during repartitioning
-                        zone_allocations[zone_type] = min_constraint
-                    else:
-                        zone_allocations[zone_type] = new_allocation
+            # Allocations exceed available space - but DO NOT reduce zones below their minimums
+            # Instead, reduce only the most flexible zones (open-space, circulation)
+            logger.warning(f"Minimum area constraints total {new_non_booth_total:.1f} sqm exceeds available {remaining_usable:.1f} sqm")
+
+            # Strategy: reduce only flexible zones (open-space) to make room for constrained zones
+            flexible_types = {ZoneType.OPEN_SPACE}
+            constrained_types = {ZoneType.MEETING, ZoneType.QUIET_ZONE, ZoneType.BREAK_ROOM, ZoneType.PHONE_BOOTH}
+
+            # Sum constrained allocations (these must stay at minimum)
+            constrained_total = sum(zone_allocations.get(zt, 0) for zt in constrained_types)
+            flexible_total = sum(zone_allocations.get(zt, 0) for zt in flexible_types)
+
+            available_for_flexible = max(0, remaining_usable - constrained_total)
+            if flexible_total > 0 and available_for_flexible >= 0:
+                scale_flexible = available_for_flexible / flexible_total
+                for zone_type in flexible_types:
+                    if zone_type in zone_allocations:
+                        zone_allocations[zone_type] *= scale_flexible
+                logger.info(f"  Reduced open-space from {flexible_total:.1f} to {available_for_flexible:.1f} sqm to preserve constraint minimums")
         elif new_non_booth_total < remaining_usable:
             # Extra space - give to open space and circulation for flexibility
             extra_space = remaining_usable - new_non_booth_total
