@@ -461,12 +461,91 @@ class SpaceCalculator:
         success = self._guillotine_cut(areas, 0, 0, side_length, side_length, rectangles, zone_name_to_type, depth=0)
 
         if not success:
-            logger.error(f"GUILLOTINE FAILED on first attempt")
-            # Last resort: use full container for each zone, no cuts
-            # This is a fallback that fills the container without perfect pavilage
-            logger.warning(f"Fallback: assigning full container to zones")
-            for zone in working_zones:
-                rectangles[zone.name] = (0, 0, side_length, side_length)
+            logger.error(f"GUILLOTINE FAILED: Constraints too tight, using fallback row-packing")
+            # Fallback: Deterministic row-packing that GUARANTEES all zones are placed
+            # Uses FIXED rows with equal height allocation
+            rectangles = {}
+
+            # Calculate fixed row height to ensure we can fit all zones
+            num_zones = len(areas)
+            num_rows = max(1, math.ceil(math.sqrt(num_zones)))
+            fixed_row_height = side_length / num_rows
+
+            logger.info(f"Fallback using {num_rows} rows, each {fixed_row_height:.2f}m tall")
+
+            row_idx = 0
+            zones_in_current_row = []
+
+            # Group zones into rows
+            for name, area in areas:
+                zones_in_current_row.append((name, area))
+                # Calculate how many zones fit in one row
+                target_per_row = max(1, math.ceil(num_zones / num_rows))
+                if len(zones_in_current_row) >= target_per_row and row_idx < num_rows - 1:
+                    row_idx += 1
+                    zones_in_current_row = []
+
+            # Now place zones row by row with fixed allocation
+            placed_count = 0
+            row_idx = 0
+            zones_in_row = []
+
+            for name, area in areas:
+                zones_in_row.append((name, area))
+                target_per_row = max(1, math.ceil(num_zones / num_rows))
+
+                # Check if we should place this row
+                place_row_now = len(zones_in_row) >= target_per_row or name == areas[-1][0]
+
+                if place_row_now and zones_in_row:
+                    # Calculate y position for this row
+                    y_pos = row_idx * fixed_row_height
+
+                    # Check if we're within bounds
+                    if y_pos >= side_length - 0.01:
+                        logger.error(f"Row {row_idx} at y={y_pos:.2f} exceeds bounds")
+                        break
+
+                    # Distribute zones in this row across available width
+                    zones_in_row_count = len(zones_in_row)
+                    col_width = side_length / zones_in_row_count
+
+                    for col_idx, (zname, zarea) in enumerate(zones_in_row):
+                        x_pos = col_idx * col_width
+
+                        # Zone dimensions: take allocated grid space or less
+                        zone_width = col_width - 0.01  # Leave small margin
+                        zone_height = fixed_row_height - 0.01  # Leave small margin
+
+                        # Try to respect area if possible
+                        desired_width = math.sqrt(zarea * 1.2)
+                        if desired_width < zone_width:
+                            zone_width = desired_width
+                            zone_height = zarea / zone_width if zone_width > 0 else zone_height
+
+                        # Enforce bounds
+                        zone_height = min(zone_height, fixed_row_height - 0.01)
+                        zone_width = min(zone_width, col_width - 0.01)
+
+                        # Minimum size
+                        zone_width = max(0.5, zone_width)
+                        zone_height = max(0.5, zone_height)
+
+                        # Final bounds check before placement
+                        if x_pos + zone_width > side_length:
+                            zone_width = side_length - x_pos - 0.01
+                        if y_pos + zone_height > side_length:
+                            zone_height = side_length - y_pos - 0.01
+
+                        if zone_width > 0 and zone_height > 0:
+                            rectangles[zname] = (x_pos, y_pos, zone_width, zone_height)
+                            placed_count += 1
+                            logger.debug(f"Fallback placed {zname}: ({x_pos:.2f}, {y_pos:.2f}) {zone_width:.2f}×{zone_height:.2f}")
+
+                    zones_in_row = []
+                    row_idx += 1
+
+            logger.warning(f"Fallback layout assigned {placed_count}/{len(areas)} zones using row-grid allocation")
 
         # Assign coordinates from guillotine output
         for zone in working_zones:
@@ -481,6 +560,13 @@ class SpaceCalculator:
                 logger.info(f"ASSIGN GUILLOTINE: {zone.name} w={w:.2f}, l={h:.2f}, sqm={zone.sqm:.2f}")
             else:
                 logger.error(f"GUILLOTINE MISSING: {zone.name} not in rectangles output")
+
+        # NOTE: Surface values set by guillotine/fallback may differ from target
+        # This is expected when shape constraints make perfect packing impossible
+        # As per user requirements: "Adjust zone surfaces if constraints impossible to satisfy"
+        final_total = sum(z.sqm for z in working_zones)
+        if abs(final_total - self.surface_sqm) > 0.1:
+            logger.warning(f"Surface difference (constraints required adjustment): {final_total:.2f} vs target {self.surface_sqm:.2f} sqm")
 
         # Verify all zones have coordinates
         for zone in working_zones:
