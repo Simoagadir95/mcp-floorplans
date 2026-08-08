@@ -9,7 +9,7 @@
 > Host: localhost:8851
 > User-Agent: curl/8.5.0
 > Accept: */*
-> Authorization: Bearer DWgedWnxfry2T4WnYzBCc1Fzu9BnjA2V9Mt2E3TNnI0
+> Authorization: Bearer [REDACTED]
 > 
 < HTTP/1.1 200 OK
 < date: Sat, 08 Aug 2026 19:18:29 GMT
