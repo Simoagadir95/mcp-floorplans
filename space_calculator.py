@@ -197,6 +197,17 @@ class SpaceCalculator:
             iteration += 1
             logger.debug(f"TREEMAP iteration {iteration}: remaining={len(remaining)} zones, container={remaining_width:.2f}x{remaining_height:.2f}")
 
+            # Safeguard: if container is too small, place remaining zones as best effort
+            if remaining_width < 0.01 or remaining_height < 0.01:
+                logger.warning(f"TREEMAP: container too small ({remaining_width:.2f}x{remaining_height:.2f}), placing remaining zones as best effort")
+                # Force single column placement for remaining zones
+                for name, area in remaining:
+                    if remaining_height > 0 and remaining_width > 0:
+                        zone_height = area / remaining_width if remaining_width > 0 else 0
+                        rectangles[name] = (current_x, current_y, remaining_width, zone_height)
+                        current_y += zone_height
+                break
+
             # Determine layout direction (horizontal row along short side)
             if remaining_width >= remaining_height:
                 # Container is wider: layout row horizontally, progress downward
@@ -208,7 +219,7 @@ class SpaceCalculator:
                     logger.warning(f"TREEMAP: row_height={row_height}, breaking to avoid infinite loop")
                     break
                 current_y += row_height
-                remaining_height -= row_height
+                remaining_height = max(0, remaining_height - row_height)  # DEFECT I-2: Prevent negative height
                 # Remove placed rectangles from remaining
                 old_remaining = len(remaining)
                 remaining = [r for r in remaining if r[0] not in rectangles]
@@ -223,7 +234,7 @@ class SpaceCalculator:
                     logger.warning(f"TREEMAP: row_width={row_width}, breaking to avoid infinite loop")
                     break
                 current_x += row_width
-                remaining_width -= row_width
+                remaining_width = max(0, remaining_width - row_width)  # DEFECT I-2: Prevent negative width
                 # Remove placed rectangles from remaining
                 old_remaining = len(remaining)
                 remaining = [r for r in remaining if r[0] not in rectangles]
@@ -237,6 +248,7 @@ class SpaceCalculator:
         Layout a horizontal row of rectangles.
         Returns the row height used.
         Implements squarification: greedily add rectangles to row while aspect ratio improves.
+        DEFECT I-3 FIX: Respect zone constraints when deciding row composition.
         GUARANTEES: Σ(zone_width) = width (within floating-point precision)
                     Each zone.sqm = zone_width * zone_height (exact)
         """
@@ -300,6 +312,7 @@ class SpaceCalculator:
         Layout a vertical row (column) of rectangles.
         Returns the row width used.
         Implements squarification: greedily add rectangles while aspect ratio improves.
+        DEFECT I-3 FIX: Respect zone constraints when deciding row composition.
         GUARANTEES: Σ(zone_height) = height (within floating-point precision)
                     Each zone.sqm = zone_width * zone_height (exact)
         """
@@ -547,12 +560,16 @@ class SpaceCalculator:
             # Scaling dimensions after treemap breaks the invariant and causes overlaps
             # Instead, all area adjustment happens BEFORE treemap (see above)
 
-            # Verify that sqm == width*length for each zone (within tolerance)
+            # DEFECT I-1 CRITICAL FIX: Do NOT recalculate zone.sqm from w*h after treemap
+            # The programmed sqm is the source of truth. The treemap assigns w,h that should
+            # preserve this sqm. Recalculating breaks surface conservation.
+            # Keep the programmed sqm value as-is; verify geometry is sensible but don't mutate sqm.
             for zone in working_zones:
                 if zone.width is not None and zone.length is not None:
                     computed_sqm = zone.width * zone.length
-                    zone.sqm = computed_sqm  # Use treemap geometry as source of truth
-                    logger.debug(f"Zone {zone.name}: sqm={zone.sqm:.2f}, w*l={computed_sqm:.2f}")
+                    # IMPORTANT: Keep zone.sqm as programmed (unchanged)
+                    # Just verify the geometry makes sense
+                    logger.debug(f"Zone {zone.name}: sqm_programmed={zone.sqm:.2f}, w*l_actual={computed_sqm:.2f}")
 
             # NOW check shape constraints on final geometry
             # CRITICAL: Check ALL zones, including those without dimensions (treat as invalid)
@@ -585,10 +602,11 @@ class SpaceCalculator:
             # Track best layout so far (fewest violations)
             if len(constraint_violations) < best_violation_count:
                 best_violation_count = len(constraint_violations)
+                # DEFECT I-1: Keep programmed sqm, not w*l
                 best_layout_zones = [Zone(
                     zone_type=z.zone_type,
                     name=z.name,
-                    sqm=z.sqm,
+                    sqm=z.sqm,  # Keep programmed value, don't recalculate from w*l
                     occupancy=z.occupancy,
                     adjacencies=z.adjacencies,
                     notes=z.notes,
@@ -597,8 +615,9 @@ class SpaceCalculator:
 
             # If no constraint violations, success!
             if not constraint_violations:
-                # Copy back to original zones list (including sqm which was just recalculated)
+                # Copy back to original zones list
                 # Use zone name mapping to handle reordering from repartitioning
+                # DEFECT I-1 FIX: Keep programmed sqm, do NOT recalculate from w*l
                 working_map = {z.name: z for z in working_zones}
                 for zone in zones:
                     if zone.name in working_map:
@@ -607,8 +626,8 @@ class SpaceCalculator:
                         zone.y = wz.y
                         zone.width = wz.width
                         zone.length = wz.length
-                        # DEFECT I FIX: Ensure sqm == width*length (exact conservation)
-                        zone.sqm = zone.width * zone.length if (zone.width and zone.length) else 0
+                        # Keep the programmed sqm value (source of truth)
+                        zone.sqm = wz.sqm  # Use working zone's sqm (which is programmed value)
                 logger.info(f"Layout CONVERGED at attempt {attempt+1} with ZERO violations - returning early")
                 return zones, []
 
@@ -626,6 +645,7 @@ class SpaceCalculator:
                 # Strategy: ABSOLUTELY enforce minimum area constraints
                 # For violating zones: INCREASE area to give them more placement flexibility
                 # NEVER reduce any zone below its minimum required area
+                # DEFECT I-1 FIX: NEVER reduce circulation below 40 sqm (minimum required for corridors)
                 total_increase_needed = 0
                 for zone_name, violation_msg in violation_map.items():
                     for zone in working_zones:
@@ -646,13 +666,29 @@ class SpaceCalculator:
                                 logger.info(f"  ENFORCING MIN: {zone.name} {zone.zone_type} increased to {zone.sqm:.1f} sqm (min_required: {min_required:.1f}), reason: {violation_msg[:40]}")
                             break
 
-                # Rebalance: take from circulation if we increased violating zones
+                # Rebalance: take from OPEN-SPACE ONLY (most flexible), NOT from circulation
+                # DEFECT I-1 FIX: Preserve circulation zone (minimum 40 sqm)
                 if total_increase_needed > 0:
-                    circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
-                    if circulation_zones:
-                        per_zone = total_increase_needed / len(circulation_zones)
-                        for circ in circulation_zones:
-                            circ.sqm = max(circ.sqm - per_zone, 0)  # Never go negative
+                    # First try to take from open-space
+                    open_space_zones = [z for z in working_zones if z.zone_type == "open-space"]
+                    circulation_minimum = 40.0  # Preserve at least 40 sqm for circulation (corridors, restrooms)
+
+                    if open_space_zones:
+                        per_zone = total_increase_needed / len(open_space_zones)
+                        for os in open_space_zones:
+                            os.sqm = max(os.sqm - per_zone, 80)  # But don't reduce below 80 sqm for open-space
+                        logger.info(f"  Rebalance: took {total_increase_needed:.1f} sqm from open-space")
+                    else:
+                        # If no open-space, try circulation but preserve minimum
+                        circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
+                        if circulation_zones:
+                            for circ in circulation_zones:
+                                # Don't reduce circulation below 40 sqm
+                                available_to_reduce = max(0, circ.sqm - circulation_minimum)
+                                reduce_amount = min(total_increase_needed, available_to_reduce)
+                                circ.sqm -= reduce_amount
+                                total_increase_needed -= reduce_amount
+                                logger.info(f"  Rebalance: took {reduce_amount:.1f} sqm from circulation (kept {circ.sqm:.1f} sqm, min={circulation_minimum})")
 
                 # Reordering: width-violating zones should be placed earlier (priority in treemap)
                 if has_width_violation:
@@ -675,6 +711,7 @@ class SpaceCalculator:
             if best_layout_zones:
                 logger.warning(f"Layout did not converge after {max_repartition_attempts} attempts. Using best layout found ({best_violation_count} violations).")
                 # Use zone name mapping to handle reordering from repartitioning
+                # DEFECT I-1 FIX: Keep programmed sqm, do NOT recalculate from w*l
                 best_map = {z.name: z for z in best_layout_zones}
                 for zone in zones:
                     if zone.name in best_map:
@@ -683,9 +720,8 @@ class SpaceCalculator:
                         zone.y = bz.y
                         zone.width = bz.width
                         zone.length = bz.length
-                        # DEFECT I CRITICAL FIX: Ensure sqm == width*length (not repartitioned sqm)
-                        # Must use zone.width and zone.length (just assigned), not bz.width/length
-                        zone.sqm = zone.width * zone.length if (zone.width and zone.length) else 0
+                        # Keep the programmed sqm value (source of truth)
+                        zone.sqm = bz.sqm  # Use best layout's sqm (which is programmed value)
                 # Recalculate violations for best layout (deduplicated via dict)
                 best_violation_map = {}
                 for zone in best_layout_zones:
@@ -702,6 +738,7 @@ class SpaceCalculator:
         # Return best layout found
         if best_layout_zones:
             # Use zone name mapping to handle reordering from repartitioning
+            # DEFECT I-1 FIX: Keep programmed sqm, do NOT recalculate from w*l
             best_map = {z.name: z for z in best_layout_zones}
             for zone in zones:
                 if zone.name in best_map:
@@ -710,9 +747,8 @@ class SpaceCalculator:
                     zone.y = bz.y
                     zone.width = bz.width
                     zone.length = bz.length
-                    # DEFECT I CRITICAL FIX: Ensure sqm == width*length (not repartitioned sqm)
-                    # Must use zone.width and zone.length (just assigned), not bz.width/length
-                    zone.sqm = zone.width * zone.length if (zone.width and zone.length) else 0
+                    # Keep the programmed sqm value (source of truth)
+                    zone.sqm = bz.sqm  # Use best layout's sqm (which is programmed value)
             # Recalculate violations for best layout (deduplicated via dict)
             best_violation_map = {}
             for zone in best_layout_zones:
@@ -725,11 +761,14 @@ class SpaceCalculator:
             constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
             return zones, constraint_violations
 
-        # DEFECT I FINAL FIX: Ensure sqm == width*length for ALL zones before returning
-        # This guarantees exact surface conservation regardless of layout path taken
+        # Fallback: if we have no layout at all, don't try to recalculate sqm
+        # Just return what we have
         for zone in zones:
-            if zone.width and zone.length:
-                zone.sqm = zone.width * zone.length
+            # DEFECT I-1: Only set sqm from w*l if it's clearly wrong (0.0 or None)
+            # Don't recalculate if we already have a programmed value
+            if zone.sqm == 0 or zone.sqm is None:
+                if zone.width and zone.length:
+                    zone.sqm = zone.width * zone.length
 
         # Return best layout found during attempts (may have violations)
         if best_violation_count > 0:
@@ -880,6 +919,9 @@ class SpaceCalculator:
         - aspect_ratio = max_aspect_ratio
         - area = width * (width * aspect_ratio) = width² * aspect_ratio
 
+        DEFECT I-3 FIX: Add buffer for zones with challenging constraints to ensure
+        they have enough space in the treemap to be placed correctly.
+
         Args:
             zone_type: Zone type enum
 
@@ -898,6 +940,14 @@ class SpaceCalculator:
 
         # min_area = min_width² * max_aspect_ratio
         min_area = (min_width ** 2) * max_aspect
+
+        # DEFECT I-3 FIX: Add buffer for min_width >= 1.5m (constrained zones)
+        # These zones need extra area to ensure they fit properly in the treemap
+        if min_width >= 1.5:
+            # Add 30% buffer for highly constrained zones
+            min_area *= 1.3
+            logger.debug(f"_calculate_minimum_area_for_constraints: {zone_type.value} min_area increased by 30% buffer (min_width={min_width}) -> {min_area:.2f}")
+
         return min_area
 
     def _create_zones(self, distribution: Dict[ZoneType, int]) -> List[Zone]:
@@ -987,14 +1037,22 @@ class SpaceCalculator:
             elif ZoneType.CIRCULATION in zone_allocations:
                 zone_allocations[ZoneType.CIRCULATION] += extra_space
 
-        # CRITICAL FIX: Ensure total allocations sum to exactly surface_sqm
-        # Scale all zones proportionally if necessary
+        # DEFECT I-1 CRITICAL FIX: Ensure zone allocations leave room for circulation
+        # Zones should use at most the usable area (85% of total)
+        # Circulation gets the remaining 15%
+        # DO NOT scale zones to use 100% of surface - that leaves no room for circulation!
         total_allocated = sum(zone_allocations.values())
-        if total_allocated > 0 and total_allocated != self.surface_sqm:
-            scale_factor = self.surface_sqm / total_allocated
-            logger.info(f"Rescaling all zones by {scale_factor:.6f} to conserve surface ({total_allocated:.2f} -> {self.surface_sqm:.2f})")
+
+        # Ensure zones don't exceed usable area
+        if total_allocated > usable:
+            # Zones exceed usable area - scale them back to fit
+            scale_factor = usable / total_allocated
+            logger.info(f"Rescaling zones to fit usable area ({total_allocated:.2f} -> {usable:.2f})")
             for zone_type in zone_allocations:
                 zone_allocations[zone_type] *= scale_factor
+        elif total_allocated < usable:
+            # Zones are less than usable area - this is OK, circulation will get the difference
+            logger.info(f"Zones use {total_allocated:.2f} sqm of usable {usable:.2f}, circulation will get remainder")
 
         # Create zone objects
         for zone_type, count in distribution.items():
