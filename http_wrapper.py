@@ -44,6 +44,9 @@ class LayoutResponse(BaseModel):
     project_id: str
     brief: Dict[str, Any]
     variants: list[Dict[str, Any]]
+    constraint_violations: Optional[list[str]] = None
+    is_valid: Optional[bool] = None
+    total_violations: Optional[int] = None
 
 
 # ============================================================================
@@ -105,10 +108,14 @@ async def generate_layouts(
         )
         layout_data = json.loads(layout_json)
 
+        # DEFECT F3 FIX: Include constraint violations and validity flags from mcp-floorplans
         return LayoutResponse(
             project_id=layout_data.get("project_id", "anonymous"),
             brief=layout_data.get("brief", {}),
-            variants=layout_data.get("variants", [])
+            variants=layout_data.get("variants", []),
+            constraint_violations=layout_data.get("constraint_violations", []),
+            is_valid=layout_data.get("is_valid", True),
+            total_violations=layout_data.get("total_violations", 0)
         )
     except Exception as e:
         logger.error(f"Layout generation failed: {e}")
@@ -155,10 +162,14 @@ async def get_layout(
         variants_to_return = layout_data.get("variants", [])
         logger.info(f"Layout {project_id}: returning {len(variants_to_return)} variants")
 
+        # DEFECT F3 FIX: Include constraint violations and validity flags from mcp-floorplans
         return LayoutResponse(
             project_id=project_id,
             brief=layout_data.get("brief", {}),
-            variants=variants_to_return
+            variants=variants_to_return,
+            constraint_violations=layout_data.get("constraint_violations", []),
+            is_valid=layout_data.get("is_valid", True),
+            total_violations=layout_data.get("total_violations", 0)
         )
     except Exception as e:
         logger.error(f"Layout fetch failed: {e}")
