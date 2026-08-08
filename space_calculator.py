@@ -875,10 +875,16 @@ class SpaceCalculator:
             # DEFECT D FIX: Validate and fix boundary overflows (x+width <= 20, y+length <= 20)
             # After treemap placement, some zones may overflow the 20x20 bounds.
             # Clip overflowing zones to fit within bounds, adjusting companion dimension to preserve area.
+            # CYCLE 30 FIX: Track area lost during clipping and redistribute to elastic zones.
             boundary_max = 20.0
+            total_area_before_clipping = sum(z.sqm for z in working_zones)
+            area_lost_by_zone = {}  # Track area loss per zone for redistribution
+
             for zone in working_zones:
                 if zone.x is None or zone.y is None or zone.width is None or zone.length is None:
                     continue
+
+                zone_area_before_clipping = zone.sqm
 
                 # Check width overflow (x+width > 20)
                 if zone.x + zone.width > boundary_max + 1e-6:
@@ -903,6 +909,51 @@ class SpaceCalculator:
                         )
                         zone.width = new_width
                         zone.length = available_length
+
+                # CYCLE 30 FIX: Calculate actual area after clipping and track loss
+                zone_area_after_clipping = zone.width * zone.length if zone.width and zone.length else zone.sqm
+                area_loss = zone_area_before_clipping - zone_area_after_clipping
+                if area_loss > 1e-6:
+                    area_lost_by_zone[zone.name] = area_loss
+                    logger.info(f"CYCLE 30 FIX: {zone.name} area loss: {area_loss:.4f} sqm ({zone_area_before_clipping:.2f} -> {zone_area_after_clipping:.2f})")
+
+            # CYCLE 30 FIX: Redistribute lost area to elastic zones
+            total_area_loss = sum(area_lost_by_zone.values())
+            if total_area_loss > 1e-6:
+                logger.info(f"CYCLE 30 FIX: Total area loss from clipping: {total_area_loss:.4f} sqm. Redistributing to elastic zones...")
+
+                # Find elastic zones (open-space, meeting rooms, quiet-zone) to receive redistributed area
+                elastic_zones = [z for z in working_zones if z.zone_type in ["open-space", "meeting", "quiet-zone"]]
+
+                if elastic_zones:
+                    # Redistribute proportionally to elastic zones by their current size
+                    elastic_total = sum(z.sqm for z in elastic_zones)
+                    if elastic_total > 0:
+                        for elastic_zone in elastic_zones:
+                            # Distribute proportionally to zone's current share of elastic zones
+                            proportion = elastic_zone.sqm / elastic_total
+                            area_to_add = total_area_loss * proportion
+                            elastic_zone.sqm += area_to_add
+                            logger.info(f"CYCLE 30 FIX: Added {area_to_add:.4f} sqm to {elastic_zone.name} (new total: {elastic_zone.sqm:.4f} sqm)")
+                    else:
+                        # No elastic zones, distribute evenly to any zone that isn't circulation
+                        non_circ_zones = [z for z in working_zones if z.zone_type != "circulation"]
+                        if non_circ_zones:
+                            per_zone = total_area_loss / len(non_circ_zones)
+                            for zone in non_circ_zones:
+                                zone.sqm += per_zone
+                                logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
+                else:
+                    # No elastic zones available, spread to any non-circulation zone
+                    non_circ_zones = [z for z in working_zones if z.zone_type != "circulation"]
+                    if non_circ_zones:
+                        per_zone = total_area_loss / len(non_circ_zones)
+                        for zone in non_circ_zones:
+                            zone.sqm += per_zone
+                            logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
+
+                total_area_after_redistribution = sum(z.sqm for z in working_zones)
+                logger.info(f"CYCLE 30 FIX: Area after redistribution: {total_area_after_redistribution:.4f} sqm (target: {self.surface_sqm:.4f})")
 
             # DEFECT I CRITICAL FIX: Do NOT scale dimensions after treemap
             # The treemap produces rectangles where width*length should equal the pre-scaled sqm value
@@ -953,21 +1004,42 @@ class SpaceCalculator:
                             # DEFECT D FIX (POST-CONSTRAINT): Ensure fix didn't cause boundary overflow
                             # After fixing aspect ratio, check if new dimensions cause y+length > 20 or x+width > 20
                             # This runs BEFORE the is_valid check so we can fix the boundary and re-check
+                            # CYCLE 30 FIX: Track area loss and update zone.sqm if clipping reduces area
                             boundary_max = 20.0
                             boundary_fixed = False
+                            zone_area_before_fix = zone.sqm if zone.sqm else 0
+
                             if zone.y is not None and zone.length is not None:
                                 if zone.y + zone.length > boundary_max + 1e-6:
                                     # Fix caused length overflow; need to clip it
                                     available_length = boundary_max - zone.y
                                     if available_length > 0 and zone.sqm is not None:
                                         new_width = zone.sqm / available_length
-                                        logger.warning(
-                                            f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} length overflow after fix: "
-                                            f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
-                                            f"Clipping: new_length={available_length:.3f}, new_width={new_width:.3f}"
-                                        )
-                                        zone.length = available_length
-                                        zone.width = new_width
+
+                                        # CYCLE 30 FIX: Check if new_width also overflows
+                                        if zone.x is not None and zone.x + new_width > boundary_max + 1e-6:
+                                            # Both dimensions are constrained; reduce zone.sqm to fit
+                                            available_width = boundary_max - zone.x
+                                            actual_area = available_width * available_length
+                                            logger.warning(
+                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} overflows both dimensions: "
+                                                f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}, "
+                                                f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
+                                                f"Clipping to fit: new_length={available_length:.3f}, new_width={available_width:.3f}, "
+                                                f"actual_area={actual_area:.2f} (was {zone.sqm:.2f})"
+                                            )
+                                            zone.length = available_length
+                                            zone.width = available_width
+                                            # CYCLE 30 FIX: Update zone.sqm to match actual area
+                                            zone.sqm = actual_area
+                                        else:
+                                            logger.warning(
+                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} length overflow after fix: "
+                                                f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
+                                                f"Clipping: new_length={available_length:.3f}, new_width={new_width:.3f}"
+                                            )
+                                            zone.length = available_length
+                                            zone.width = new_width
                                         boundary_fixed = True
 
                             if not boundary_fixed and zone.x is not None and zone.width is not None:
@@ -976,13 +1048,31 @@ class SpaceCalculator:
                                     available_width = boundary_max - zone.x
                                     if available_width > 0 and zone.sqm is not None:
                                         new_length = zone.sqm / available_width
-                                        logger.warning(
-                                            f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} width overflow after fix: "
-                                            f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
-                                            f"Clipping: new_width={available_width:.3f}, new_length={new_length:.3f}"
-                                        )
-                                        zone.width = available_width
-                                        zone.length = new_length
+
+                                        # CYCLE 30 FIX: Check if new_length also overflows
+                                        if zone.y is not None and zone.y + new_length > boundary_max + 1e-6:
+                                            # Both dimensions are constrained; reduce zone.sqm to fit
+                                            available_length = boundary_max - zone.y
+                                            actual_area = available_width * available_length
+                                            logger.warning(
+                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} overflows both dimensions: "
+                                                f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}, "
+                                                f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
+                                                f"Clipping to fit: new_width={available_width:.3f}, new_length={available_length:.3f}, "
+                                                f"actual_area={actual_area:.2f} (was {zone.sqm:.2f})"
+                                            )
+                                            zone.width = available_width
+                                            zone.length = available_length
+                                            # CYCLE 30 FIX: Update zone.sqm to match actual area
+                                            zone.sqm = actual_area
+                                        else:
+                                            logger.warning(
+                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} width overflow after fix: "
+                                                f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
+                                                f"Clipping: new_width={available_width:.3f}, new_length={new_length:.3f}"
+                                            )
+                                            zone.width = available_width
+                                            zone.length = new_length
                                         boundary_fixed = True
 
                             # Re-check constraint after boundary fix
@@ -1011,6 +1101,45 @@ class SpaceCalculator:
             if has_overlaps:
                 logger.info(f"Layout attempt {attempt+1}: {len(overlap_list)} overlaps detected")
                 constraint_violations.extend([f"OVERLAP: {z1} and {z2} ({area:.4f} sqm)" for z1, z2, area in overlap_list])
+
+            # CYCLE 30 FIX: After all clipping and constraint fixing, check if total area matches target
+            # If area was lost during clipping, redistribute it to elastic zones
+            current_total_area = sum(z.sqm for z in working_zones)
+            area_deficit = self.surface_sqm - current_total_area
+            if area_deficit > 1e-3:  # More than 0.001 sqm deficit
+                logger.info(f"CYCLE 30 FIX: Area deficit detected at attempt {attempt+1}: {area_deficit:.4f} sqm (current: {current_total_area:.4f}, target: {self.surface_sqm:.4f}). Redistributing...")
+
+                # Find elastic zones to receive redistributed area
+                elastic_zones = [z for z in working_zones if z.zone_type in ["open-space", "meeting", "quiet-zone"]]
+
+                if elastic_zones:
+                    # Redistribute proportionally to elastic zones by their current size
+                    elastic_total = sum(z.sqm for z in elastic_zones)
+                    if elastic_total > 0:
+                        for elastic_zone in elastic_zones:
+                            # Distribute proportionally to zone's current share of elastic zones
+                            proportion = elastic_zone.sqm / elastic_total
+                            area_to_add = area_deficit * proportion
+                            elastic_zone.sqm += area_to_add
+                            logger.info(f"CYCLE 30 FIX: Added {area_to_add:.4f} sqm to {elastic_zone.name} (new total: {elastic_zone.sqm:.4f} sqm)")
+                    else:
+                        # No elastic zones with area, distribute evenly
+                        if elastic_zones:
+                            per_zone = area_deficit / len(elastic_zones)
+                            for zone in elastic_zones:
+                                zone.sqm += per_zone
+                                logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
+                else:
+                    # No elastic zones, distribute to any non-circulation zone
+                    non_circ_zones = [z for z in working_zones if z.zone_type != "circulation"]
+                    if non_circ_zones:
+                        per_zone = area_deficit / len(non_circ_zones)
+                        for zone in non_circ_zones:
+                            zone.sqm += per_zone
+                            logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
+
+                new_total_area = sum(z.sqm for z in working_zones)
+                logger.info(f"CYCLE 30 FIX: Area after redistribution: {new_total_area:.4f} sqm (target: {self.surface_sqm:.4f})")
 
             # Track best layout so far (fewest violations)
             if len(constraint_violations) < best_violation_count:
@@ -1061,7 +1190,9 @@ class SpaceCalculator:
                 logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
 
                 # CYCLE 30 FIX: For elastic zones (circulation) with aspect ratio violations,
-                # reduce their sqm so they fit better in available space
+                # reduce their sqm so they fit better in available space, then redistribute lost area
+                circulation_reduced_with_aspect_violation = False
+                total_reduction = 0.0
                 for zone in working_zones:
                     if zone.zone_type == "circulation" and zone.name in violation_map:
                         msg = violation_map[zone.name]
@@ -1069,6 +1200,8 @@ class SpaceCalculator:
                             # Reduce circulation by 5% to allow better placement in constrained space
                             reduction = zone.sqm * 0.05
                             zone.sqm = max(zone.sqm - reduction, 40.0)
+                            total_reduction += reduction
+                            circulation_reduced_with_aspect_violation = True
                             logger.info(f"CYCLE 30 FIX: Reduced {zone.name} from {zone.sqm + reduction:.1f} to {zone.sqm:.1f} sqm (aspect ratio violation)")
 
                 # Repartition strategy: redistribute area from non-violating zones to violating zones
@@ -1082,10 +1215,17 @@ class SpaceCalculator:
                 # For violating zones: INCREASE area to give them more placement flexibility
                 # NEVER reduce any zone below its minimum required area
                 # DEFECT I-1 FIX: NEVER reduce circulation below 40 sqm (minimum required for corridors)
+                # CYCLE 30 FIX: Do NOT increase circulation zone if it was reduced for aspect ratio violation
                 total_increase_needed = 0
                 for zone_name, violation_msg in violation_map.items():
                     for zone in working_zones:
                         if zone.name == zone_name:
+                            # CYCLE 30 FIX: Skip circulation zones with aspect ratio violations
+                            # They were already reduced to fit better; don't increase them back
+                            if zone.zone_type == "circulation" and "aspect ratio" in violation_msg and circulation_reduced_with_aspect_violation:
+                                logger.info(f"CYCLE 30 FIX: Skipping increase for {zone.name} (was reduced for aspect ratio violation)")
+                                break
+
                             # DEFECT E FIX: Phone booths are FIXED SIZE (2.5 sqm per booth)
                             # Do NOT repartition phone booths — they maintain their size
                             if zone.zone_type == "phone-booth":
@@ -1107,6 +1247,7 @@ class SpaceCalculator:
 
                 # Rebalance: take from OPEN-SPACE ONLY (most flexible), NOT from circulation
                 # DEFECT I-1 FIX: Preserve circulation zone (minimum 40 sqm)
+                # CYCLE 30 FIX: If circulation was reduced for aspect ratio violation, do NOT take from it further
                 if total_increase_needed > 0:
                     # First try to take from open-space
                     open_space_zones = [z for z in working_zones if z.zone_type == "open-space"]
@@ -1117,7 +1258,8 @@ class SpaceCalculator:
                         for os in open_space_zones:
                             os.sqm = max(os.sqm - per_zone, 80)  # But don't reduce below 80 sqm for open-space
                         logger.info(f"  Rebalance: took {total_increase_needed:.1f} sqm from open-space")
-                    else:
+                    elif not circulation_reduced_with_aspect_violation:
+                        # CYCLE 30 FIX: Only take from circulation if it wasn't reduced for aspect ratio violation
                         # If no open-space, try circulation but preserve minimum
                         circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
                         if circulation_zones:
@@ -1128,6 +1270,10 @@ class SpaceCalculator:
                                 circ.sqm -= reduce_amount
                                 total_increase_needed -= reduce_amount
                                 logger.info(f"  Rebalance: took {reduce_amount:.1f} sqm from circulation (kept {circ.sqm:.1f} sqm, min={circulation_minimum})")
+                    else:
+                        # CYCLE 30 FIX: Circulation was reduced for aspect ratio violation, don't take from it
+                        # Instead, reduce the increase needed amount or leave it unfunded
+                        logger.info(f"  Rebalance: circulation was reduced for aspect ratio violation, skipping circulation reduction")
 
                 # Reordering: width-violating zones should be placed earlier (priority in treemap)
                 if has_width_violation:
