@@ -536,7 +536,26 @@ class SpaceCalculator:
 
             # Apply treemap to ALL zones (including circulation)
             areas = [(z.name, z.sqm) for z in working_zones]
-            areas.sort(key=lambda x: -x[1])  # Sort descending by area
+
+            # DEFECT I-3 FIX: Prioritize constrained zones (those with high min_width)
+            # Sort primarily by min_width (zones with high constraints first), then by area (largest first)
+            def get_zone_priority(zone_name_area):
+                zone_name, area = zone_name_area
+                zone_type_str = zone_name_to_type.get(zone_name) if zone_name_to_type else None
+                if zone_type_str:
+                    try:
+                        zone_type_enum = ZoneType(zone_type_str)
+                        constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum)
+                        if constraints:
+                            min_width = constraints.get("min_width", 0)
+                            # High min_width gets priority (higher number = higher priority)
+                            # Break-room (1.8) and others with high min_width come first
+                            return (min_width, area)  # Sort by min_width desc, then area desc
+                    except ValueError:
+                        pass
+                return (0, area)  # Default: just sort by area
+
+            areas.sort(key=lambda x: get_zone_priority(x), reverse=True)
 
             rectangles: Dict[str, Tuple[float, float, float, float]] = {}
 
@@ -659,11 +678,14 @@ class SpaceCalculator:
 
                             # Strategy: ALL violations warrant INCREASING the violating zone's area
                             # More sqm gives treemap more flexibility to place it properly
-                            if zone.sqm < min_required * 1.5:
-                                increase = (min_required * 1.5) - zone.sqm
+                            # DEFECT I-3: For break-room specifically, be more aggressive (2.0x instead of 1.5x)
+                            # because it has the tightest min_width constraint (1.8m)
+                            multiplier = 2.0 if zone.zone_type == "break-room" else 1.5
+                            if zone.sqm < min_required * multiplier:
+                                increase = (min_required * multiplier) - zone.sqm
                                 zone.sqm += increase
                                 total_increase_needed += increase
-                                logger.info(f"  ENFORCING MIN: {zone.name} {zone.zone_type} increased to {zone.sqm:.1f} sqm (min_required: {min_required:.1f}), reason: {violation_msg[:40]}")
+                                logger.info(f"  ENFORCING MIN: {zone.name} {zone.zone_type} increased to {zone.sqm:.1f} sqm (min_required: {min_required:.1f}, multiplier={multiplier}), reason: {violation_msg[:40]}")
                             break
 
                 # Rebalance: take from OPEN-SPACE ONLY (most flexible), NOT from circulation
@@ -941,12 +963,16 @@ class SpaceCalculator:
         # min_area = min_width² * max_aspect_ratio
         min_area = (min_width ** 2) * max_aspect
 
-        # DEFECT I-3 FIX: Add buffer for min_width >= 1.5m (constrained zones)
+        # DEFECT I-3 FIX: Add buffer for constrained zones based on min_width
         # These zones need extra area to ensure they fit properly in the treemap
-        if min_width >= 1.5:
-            # Add 30% buffer for highly constrained zones
-            min_area *= 1.3
-            logger.debug(f"_calculate_minimum_area_for_constraints: {zone_type.value} min_area increased by 30% buffer (min_width={min_width}) -> {min_area:.2f}")
+        if min_width >= 1.8:
+            # Add 35% buffer for highly constrained zones (break-room, meeting, quiet-zone, open-space)
+            min_area *= 1.35
+            logger.debug(f"_calculate_minimum_area_for_constraints: {zone_type.value} min_area increased by 35% buffer (min_width={min_width}) -> {min_area:.2f}")
+        elif min_width >= 1.0:
+            # Add 25% buffer for moderately constrained zones (phone-booth)
+            min_area *= 1.25
+            logger.debug(f"_calculate_minimum_area_for_constraints: {zone_type.value} min_area increased by 25% buffer (min_width={min_width}) -> {min_area:.2f}")
 
         return min_area
 
