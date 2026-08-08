@@ -299,14 +299,32 @@ class SpaceCalculator:
                 row_height = row_total_area / width if width > 0 else 0
                 logger.debug(f"Removed {removed_name} (area={removed_area:.3f}), row now has {len(row)} zones, new row_height={row_height:.3f}")
 
-            # If still not fitting (single zone too large), log warning but place anyway
-            # Constraint checking will catch the violation
+            # If still not fitting (single zone too large), apply orientation-swap fallback
+            # DEFECT J-1 FIX: Instead of placing with overflow, place as a vertical slice
+            # Vertical slice: width = area / height_available, height = height_available
+            # This guarantees w*h == area exactly and preserves area conservation
             if row_height > height + 1e-3 and len(row) == 1:
-                logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_height={row_height:.3f} but only {height:.3f} available - placing anyway for constraint detection")
+                name, area = row[0]
+                # Use orientation swap: place as vertical slice (perpendicular to normal row orientation)
+                # Vertical slice width might be narrower than available width (OK - uses less space)
+                # OR wider (would overflow) - in that case, we need repartitioning
+                vertical_slice_width = area / height if height > 0 else 0
+
+                if vertical_slice_width <= width + 1e-6:
+                    # Slice fits within available width - place it
+                    rectangles[name] = (x, y, vertical_slice_width, height)
+                    logger.info(f"DEFECT J-1 FIX (ORIENTATION SWAP): Single zone {name} (area={area:.2f}) placed as vertical slice: w={vertical_slice_width:.2f}, h={height:.2f}, w*h={vertical_slice_width*height:.2f}")
+                    return height  # Height is consumed, main loop progresses vertically
+                else:
+                    # Zone's area is too large even for vertical slice
+                    # Need to skip and trigger repartitioning
+                    logger.warning(f"DEFECT J-1 FIX: Single zone {name} (area={area:.3f}) cannot fit: width_available={width:.3f}, height_available={height:.3f}, required_width_for_slice={vertical_slice_width:.3f} - triggering repartitioning")
+                    # Clear row so main loop gets 0 and repartitions
+                    row.clear()
+                    return 0.0
 
             # CIRCULATION OVERFLOW FIX: Check absolute position bounds (y+height <= 20.0)
-            # DEFECT J-1 FIX: Prevent zones from overflowing the floorplan's absolute boundary
-            # If zone would overflow, reject it and force repartitioning
+            # For multi-zone rows, ensure they don't overflow
             absolute_max = 20.0
             if y + row_height > absolute_max + 1e-3 and len(row) > 1:
                 logger.warning(f"DEFECT J-1 FIX: y={y:.3f} + row_height={row_height:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
@@ -316,8 +334,6 @@ class SpaceCalculator:
                     row_total_area -= removed_area
                     row_height = row_total_area / width if width > 0 else 0
                     logger.debug(f"Removed {removed_name} (area={removed_area:.3f}) for overflow, new y+height={y + row_height:.3f}")
-            elif y + row_height > absolute_max + 1e-3 and len(row) == 1:
-                logger.warning(f"DEFECT J-1: Single zone overflow: y={y:.3f} + height={row_height:.3f} = {y + row_height:.3f} exceeds {absolute_max} - will be caught by constraint checker")
 
             if not row:
                 # All zones were removed - shouldn't happen but handle gracefully
@@ -400,14 +416,32 @@ class SpaceCalculator:
                 row_width = row_total_area / height if height > 0 else 0
                 logger.debug(f"Removed {removed_name} (area={removed_area:.3f}), row now has {len(row)} zones, new row_width={row_width:.3f}")
 
-            # If still not fitting (single zone too large), log warning but place anyway
-            # Constraint checking will catch the violation
+            # If still not fitting (single zone too large), apply orientation-swap fallback
+            # DEFECT J-1 FIX: Instead of placing with overflow, place as a horizontal slice
+            # Horizontal slice: width = width_available, height = area / width_available
+            # This guarantees w*h == area exactly and preserves area conservation
             if row_width > width + 1e-3 and len(row) == 1:
-                logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_width={row_width:.3f} but only {width:.3f} available - placing anyway for constraint detection")
+                name, area = row[0]
+                # Use orientation swap: place as horizontal slice (perpendicular to normal row orientation)
+                # Horizontal slice height might be narrower than available height (OK - uses less space)
+                # OR taller (would overflow) - in that case, we need repartitioning
+                horizontal_slice_height = area / width if width > 0 else 0
+
+                if horizontal_slice_height <= height + 1e-6:
+                    # Slice fits within available height - place it
+                    rectangles[name] = (x, y, width, horizontal_slice_height)
+                    logger.info(f"DEFECT J-1 FIX (ORIENTATION SWAP): Single zone {name} (area={area:.2f}) placed as horizontal slice: w={width:.2f}, h={horizontal_slice_height:.2f}, w*h={width*horizontal_slice_height:.2f}")
+                    return width  # Width is consumed, main loop progresses horizontally
+                else:
+                    # Zone's area is too large even for horizontal slice
+                    # Need to skip and trigger repartitioning
+                    logger.warning(f"DEFECT J-1 FIX: Single zone {name} (area={area:.3f}) cannot fit: height_available={height:.3f}, width_available={width:.3f}, required_height_for_slice={horizontal_slice_height:.3f} - triggering repartitioning")
+                    # Clear row so main loop gets 0 and repartitions
+                    row.clear()
+                    return 0.0
 
             # CIRCULATION OVERFLOW FIX: Check absolute position bounds (x+width <= 20.0)
-            # DEFECT J-1 FIX: Prevent zones from overflowing the floorplan's absolute boundary
-            # If zone would overflow, reject it and force repartitioning
+            # For multi-zone rows, ensure they don't overflow
             absolute_max = 20.0
             if x + row_width > absolute_max + 1e-3 and len(row) > 1:
                 logger.warning(f"DEFECT J-1 FIX: x={x:.3f} + row_width={row_width:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
@@ -417,8 +451,6 @@ class SpaceCalculator:
                     row_total_area -= removed_area
                     row_width = row_total_area / height if height > 0 else 0
                     logger.debug(f"Removed {removed_name} (area={removed_area:.3f}) for overflow, new x+width={x + row_width:.3f}")
-            elif x + row_width > absolute_max + 1e-3 and len(row) == 1:
-                logger.warning(f"DEFECT J-1: Single zone overflow: x={x:.3f} + width={row_width:.3f} = {x + row_width:.3f} exceeds {absolute_max} - will be caught by constraint checker")
 
             if not row:
                 # All zones were removed - shouldn't happen but handle gracefully
@@ -627,9 +659,11 @@ class SpaceCalculator:
         if zone.x is not None and zone.y is not None and zone.width is not None and zone.length is not None:
             if zone.x < 0 or zone.y < 0:
                 return False, f"Zone position out of bounds: x={zone.x:.3f}, y={zone.y:.3f} (must be >= 0)"
-            if zone.x + zone.width > 20.0 + 1e-6:
+            x_overflow = zone.x + zone.width - 20.0
+            y_overflow = zone.y + zone.length - 20.0
+            if x_overflow > 1e-6:
                 return False, f"Zone width overflows: x={zone.x:.3f}, width={zone.width:.3f}, x+w={zone.x+zone.width:.3f} (max 20.0)"
-            if zone.y + zone.length > 20.0 + 1e-6:
+            if y_overflow > 1e-6:
                 return False, f"Zone length overflows: y={zone.y:.3f}, length={zone.length:.3f}, y+l={zone.y+zone.length:.3f} (max 20.0)"
 
         try:
@@ -1691,27 +1725,60 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
     logger.info(f"DEFECT F3: Re-validating all zones in all variants before returning API response")
 
     for v in variants:
-        violations = v.constraint_violations if v.constraint_violations else []
-        logger.info(f"  {v.variant_id}: reported violations={len(violations)}")
-
-        # DEFECT F3 FIX: Re-check every zone against constraints
+        # DEFECT F3 FIX: ALWAYS re-check every zone against constraints
+        # Ground truth is what _check_shape_constraints reports on the final zones
+        # Do not trust violations reported during layout - always re-validate before returning
         re_validated_violations = []
+        logger.info(f"DEFECT F3: Re-validating {v.variant_id} with {len(v.zones)} zones")
+
+        # Debug: dump all zone coordinates before validation
+        logger.info(f"DEFECT F3 PRE-VALIDATION {v.variant_id} zones:")
         for zone in v.zones:
+            logger.info(f"  {zone.name}: x={zone.x:.2f}, y={zone.y:.2f}, w={zone.width:.2f}, l={zone.length:.2f}, x+w={zone.x + zone.width if zone.x is not None and zone.width is not None else 0:.2f}")
+
+        for zone in v.zones:
+            # DEFECT F3 DEBUG: Log zone coordinates before checking
+            zone_info = f"name={zone.name}, x={zone.x}, y={zone.y}, w={zone.width}, l={zone.length}, sqm={zone.sqm}"
             is_valid, violation_msg = calc._check_shape_constraints(zone)
             if not is_valid:
                 violation_str = f"{zone.name} ({zone.zone_type}): {violation_msg}"
                 re_validated_violations.append(violation_str)
-                logger.warning(f"DEFECT F3: Re-validation caught violation: {violation_str}")
+                logger.warning(f"DEFECT F3: {v.variant_id} - {zone_info} -> VIOLATION")
+                logger.warning(f"  {violation_msg}")
+            else:
+                # Only log for zones that had high risk of overflowing
+                if zone.name in ["Quiet Zone", "Circulation & Common", "Break Room"]:
+                    logger.info(f"DEFECT F3: {v.variant_id} - {zone.name} OK: x+w={zone.x + zone.width if zone.x and zone.width else 'N/A'}")
 
-        # Use re-validated violations if they differ from reported ones
-        if len(re_validated_violations) != len(violations):
-            logger.warning(f"DEFECT F3: Violation count mismatch for {v.variant_id}: reported={len(violations)}, re-validated={len(re_validated_violations)}")
-            violations = re_validated_violations
-            # DEFECT F3 FIX: UPDATE the variant's constraint_violations with re-validated ones
-            v.constraint_violations = violations
+        # DEFECT F3 FIX: Use re-validated violations as the authoritative source
+        # Update variant's constraint_violations to match what we actually found
+        reported_violations = v.constraint_violations if v.constraint_violations else []
+        if len(re_validated_violations) != len(reported_violations):
+            logger.warning(f"DEFECT F3: Violation count mismatch for {v.variant_id}: previously_reported={len(reported_violations)}, re_validated={len(re_validated_violations)}")
+            # Log the discrepancy
+            for vstr in re_validated_violations:
+                if vstr not in reported_violations:
+                    logger.warning(f"  NEWLY FOUND: {vstr}")
+            for vstr in reported_violations:
+                if vstr not in re_validated_violations:
+                    logger.warning(f"  NO LONGER FOUND: {vstr}")
 
+        # DEFECT F3 CRITICAL FIX: Set constraint_violations to re-validated results
+        # This is the source of truth for is_valid calculation
+        v.constraint_violations = re_validated_violations
+        violations = re_validated_violations
+
+        logger.info(f"  {v.variant_id}: final violations={len(violations)}")
         total_violations.extend(violations)
         total_violation_count += len(violations)
+
+    # Debug: Log zones before serialization
+    for v in variants:
+        if v.variant_id == "collaboration-heavy-002":
+            logger.info(f"SERIALIZATION: {v.variant_id} zones BEFORE asdict:")
+            for z in v.zones:
+                if z.name == "Quiet Zone":
+                    logger.info(f"  {z.name}: x={z.x:.2f}, w={z.width:.2f}, x+w={z.x + z.width if z.x is not None and z.width is not None else 0:.2f}")
 
     layout_data = {
         "project_id": project_id,
@@ -1733,5 +1800,13 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
             for v in variants
         ]
     }
+
+    # Debug: Log zones after serialization
+    for v in variants:
+        if v.variant_id == "collaboration-heavy-002":
+            logger.info(f"SERIALIZATION: {v.variant_id} zones AFTER asdict:")
+            for z in v.zones:
+                if z.name == "Quiet Zone":
+                    logger.info(f"  {z.name}: x={z.x:.2f}, w={z.width:.2f}, x+w={z.x + z.width if z.x is not None and z.width is not None else 0:.2f}")
 
     return json.dumps(layout_data, indent=2)
