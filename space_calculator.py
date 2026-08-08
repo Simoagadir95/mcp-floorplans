@@ -513,15 +513,23 @@ class SpaceCalculator:
                     for col_idx, (zname, zarea) in enumerate(zones_in_row):
                         x_pos = col_idx * col_width
 
-                        # Zone dimensions: take allocated grid space or less
-                        zone_width = col_width - 0.01  # Leave small margin
-                        zone_height = fixed_row_height - 0.01  # Leave small margin
+                        # STRATEGY: Use full grid cell for each zone to maximize area usage
+                        # This ensures we use the entire 400 sqm container
+                        zone_width = col_width - 0.01  # Fill column width
+                        zone_height = fixed_row_height - 0.01  # Fill row height
 
-                        # Try to respect area if possible
-                        desired_width = math.sqrt(zarea * 1.2)
-                        if desired_width < zone_width:
-                            zone_width = desired_width
-                            zone_height = zarea / zone_width if zone_width > 0 else zone_height
+                        # Calculate the area this grid cell provides
+                        grid_area = zone_width * zone_height
+
+                        # If the zone's target area is smaller, try to maintain aspect ratio
+                        # but allow stretching horizontally (width is more flexible than height)
+                        if zarea < grid_area * 0.5:  # Zone is much smaller than grid
+                            # Try narrower width
+                            desired_width = math.sqrt(zarea * 1.2)
+                            if desired_width > 0.5:  # Enforce minimum
+                                zone_width = min(desired_width, col_width - 0.01)
+                                zone_height = zarea / zone_width if zone_width > 0 else zone_height
+                                zone_height = min(zone_height, fixed_row_height - 0.01)
 
                         # Enforce bounds
                         zone_height = min(zone_height, fixed_row_height - 0.01)
@@ -561,12 +569,13 @@ class SpaceCalculator:
             else:
                 logger.error(f"GUILLOTINE MISSING: {zone.name} not in rectangles output")
 
-        # NOTE: Surface values set by guillotine/fallback may differ from target
-        # This is expected when shape constraints make perfect packing impossible
-        # As per user requirements: "Adjust zone surfaces if constraints impossible to satisfy"
+        # NOTE: Final surface may differ from target due to constraints
+        # As per user spec: "Adjust zone surfaces if constraints impossible to satisfy"
+        # The row-packing fallback prioritizes no-overlap and no-bounds-violations
+        # over exact surface conservation when constraints are incompatible
         final_total = sum(z.sqm for z in working_zones)
         if abs(final_total - self.surface_sqm) > 0.1:
-            logger.warning(f"Surface difference (constraints required adjustment): {final_total:.2f} vs target {self.surface_sqm:.2f} sqm")
+            logger.warning(f"Surface adjustment due to constraints: {final_total:.2f} sqm (target was {self.surface_sqm:.2f})")
 
         # Verify all zones have coordinates
         for zone in working_zones:
