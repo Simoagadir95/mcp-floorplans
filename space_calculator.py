@@ -1060,6 +1060,17 @@ class SpaceCalculator:
             if attempt < max_repartition_attempts - 1:
                 logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
 
+                # CYCLE 30 FIX: For elastic zones (circulation) with aspect ratio violations,
+                # reduce their sqm so they fit better in available space
+                for zone in working_zones:
+                    if zone.zone_type == "circulation" and zone.name in violation_map:
+                        msg = violation_map[zone.name]
+                        if "aspect ratio" in msg and zone.sqm > 40.0:  # circulation min is 40 sqm
+                            # Reduce circulation by 5% to allow better placement in constrained space
+                            reduction = zone.sqm * 0.05
+                            zone.sqm = max(zone.sqm - reduction, 40.0)
+                            logger.info(f"CYCLE 30 FIX: Reduced {zone.name} from {zone.sqm + reduction:.1f} to {zone.sqm:.1f} sqm (aspect ratio violation)")
+
                 # Repartition strategy: redistribute area from non-violating zones to violating zones
                 # to give violating zones more flexibility in the treemap
                 # Key insight: If a zone violates min_width, it needs either more area or fewer zones in its partition
