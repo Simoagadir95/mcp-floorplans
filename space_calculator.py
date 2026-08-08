@@ -753,6 +753,8 @@ class SpaceCalculator:
 
         # Recalculate total with adjusted allocations and rescale everything proportionally
         new_non_booth_total = sum(v for k, v in zone_allocations.items() if k != ZoneType.PHONE_BOOTH)
+        extra_circulation_sqm = 0  # Track extra space to add to circulation later
+
         if new_non_booth_total > remaining_usable:
             # Allocations exceed available space - but DO NOT reduce zones below their minimums
             # Instead, reduce only the most flexible zones (open-space, circulation)
@@ -774,12 +776,14 @@ class SpaceCalculator:
                         zone_allocations[zone_type] *= scale_flexible
                 logger.info(f"  Reduced open-space from {flexible_total:.1f} to {available_for_flexible:.1f} sqm to preserve constraint minimums")
         elif new_non_booth_total < remaining_usable:
-            # Extra space - give to open space and circulation for flexibility
+            # Extra space - give to open space or track for circulation
             extra_space = remaining_usable - new_non_booth_total
             if ZoneType.OPEN_SPACE in zone_allocations:
                 zone_allocations[ZoneType.OPEN_SPACE] += extra_space
-            elif ZoneType.CIRCULATION in zone_allocations:
-                zone_allocations[ZoneType.CIRCULATION] += extra_space
+            else:
+                # Open space not in distribution - add extra space to circulation
+                extra_circulation_sqm = extra_space
+                logger.info(f"  Adding extra {extra_space:.1f} sqm to circulation (open-space not in zone types)")
 
         # Create zone objects
         for zone_type, count in distribution.items():
@@ -846,11 +850,13 @@ class SpaceCalculator:
                 )
                 zones.append(zone)
 
-        # Add circulation zone
+        # Add circulation zone (includes any extra space not allocated to other zones)
+        total_allocated = sum(z.sqm for z in zones)
+        circulation_total = self.surface_sqm - total_allocated
         zones.append(Zone(
             zone_type=ZoneType.CIRCULATION.value,
             name="Circulation & Common",
-            sqm=circulation_sqm,
+            sqm=circulation_total,
             occupancy=0,
             adjacencies=[],
             notes="Corridors, stairs, lobbies, restrooms"
