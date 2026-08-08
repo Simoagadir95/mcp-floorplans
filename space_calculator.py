@@ -607,7 +607,7 @@ class SpaceCalculator:
                         zone.length = wz.length
                         # DEFECT I FIX: Ensure sqm == width*length (exact conservation)
                         zone.sqm = zone.width * zone.length if (zone.width and zone.length) else 0
-                logger.info(f"Layout converged at attempt {attempt+1}")
+                logger.info(f"Layout CONVERGED at attempt {attempt+1} with ZERO violations - returning early")
                 return zones, []
 
             # Constraint violations detected - attempt repartitioning
@@ -694,6 +694,7 @@ class SpaceCalculator:
                         if not is_valid:
                             best_violation_map[zone.name] = violation_msg
                 constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
+                logger.critical(f"RETURNING from max_attempts block with {len(constraint_violations)} violations: {constraint_violations}")
                 return zones, constraint_violations
 
         # Return best layout found
@@ -728,7 +729,22 @@ class SpaceCalculator:
             if zone.width and zone.length:
                 zone.sqm = zone.width * zone.length
 
-        return zones, []
+        # Return best layout found during attempts (may have violations)
+        if best_violation_count > 0:
+            logger.error(f"_apply_geometric_layout: exhausted {max_repartition_attempts} attempts without full convergence. Returning best layout with {best_violation_count} violations.")
+            # Recalculate violations for the best layout to return them
+            final_violations = []
+            for zone in zones:
+                if zone.width is None or zone.length is None:
+                    final_violations.append(f"{zone.name}: No geometry assigned")
+                else:
+                    is_valid, violation_msg = self._check_shape_constraints(zone)
+                    if not is_valid:
+                        final_violations.append(f"{zone.name}: {violation_msg}")
+            return zones, final_violations
+        else:
+            logger.info("_apply_geometric_layout: returned best layout with zero violations")
+            return zones, []
 
     def _verify_no_overlaps(self, zones: List[Zone]) -> Tuple[bool, List[Tuple[str, str, float]]]:
         """
@@ -1196,6 +1212,7 @@ class SpaceCalculator:
         base_zones = self._create_zones(distribution)
         # Apply geometric layout (treemap) — returns (zones, violations)
         base_zones, base_violations = self._apply_geometric_layout(base_zones)
+        logger.critical(f"generate_variants: balanced layout returned {len(base_violations)} violations: {base_violations}")
         metrics = self.calculate_metrics(base_zones)
 
         # Variant 1: Balanced (base)
@@ -1208,6 +1225,7 @@ class SpaceCalculator:
             design_notes=f"Balanced mix of collaborative and focus areas. {metrics.workstations} workstations, {metrics.meeting_rooms} meeting rooms.",
             constraint_violations=base_violations
         )
+        logger.critical(f"variant_1 created with constraint_violations={variant_1.constraint_violations}")
         variants.append(variant_1)
 
         # Variant 2: Collaboration-heavy (if num_variants >= 2)
@@ -1285,6 +1303,9 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
     """
     calc = SpaceCalculator(surface_sqm, headcount, zone_types)
     variants = calc.generate_variants(num_variants=3)
+    logger.critical(f"generate_space_layouts_json: generated {len(variants)} variants")
+    for v in variants:
+        logger.critical(f"  {v.variant_id}: {len(v.constraint_violations)} violations")
 
     layout_data = {
         "project_id": project_id,
