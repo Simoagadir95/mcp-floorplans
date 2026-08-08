@@ -286,6 +286,11 @@ class SpaceCalculator:
         # Place the row
         if row:
             row_height = row_total_area / width if width > 0 else 0
+            # CYCLE 26 J-1 FIX: Clamp row height to available space to prevent overflow
+            # If row_height exceeds remaining container height, zones will overflow bounds
+            if row_height > height:
+                logger.info(f"CYCLE 26 J-1 FIX: Row height {row_height:.3f} exceeds available {height:.3f}m, clamping to fit container")
+                row_height = height
             current_x = x
             num_zones = len(row)
             logger.info(f"Row horizontal: placing {len(row)} zones (total_area={row_total_area:.2f}), row_height={row_height:.3f}")
@@ -349,6 +354,11 @@ class SpaceCalculator:
         # Place the row
         if row:
             row_width = row_total_area / height if height > 0 else 0
+            # CYCLE 26 J-1 FIX: Clamp row width to available space to prevent overflow
+            # If row_width exceeds remaining container width, zones will overflow bounds
+            if row_width > width:
+                logger.info(f"CYCLE 26 J-1 FIX: Row width {row_width:.3f} exceeds available {width:.3f}m, clamping to fit container")
+                row_width = width
             current_y = y
             num_zones = len(row)
 
