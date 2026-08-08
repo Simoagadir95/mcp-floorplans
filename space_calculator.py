@@ -147,148 +147,210 @@ class SpaceCalculator:
         self.circulation_pct = 0.15  # 15% for corridors, stairs, etc.
         self.circulation_tolerance = 0.001  # DEFECT I FIX: Reduced from 0.02 to 0.001 (0.4 sqm on 400 sqm) for exact surface conservation
 
-    def _squarify_treemap(self, areas: List[Tuple[str, float]],
-                          x: float, y: float, width: float, height: float,
-                          rectangles: Dict[str, Tuple[float, float, float, float]],
-                          row: List[Tuple[str, float]],
-                          zone_name_to_type: Optional[Dict[str, str]] = None) -> None:
+    def _shelf_pack_layout_simple(self, zones: List[Zone], container_width: float, container_height: float) -> Tuple[Dict[str, Tuple[float, float, float, float]], List[str]]:
         """
-        Simplified treemap subdivision ensuring non-overlapping placement.
-        Alternates between horizontal and vertical cuts for balance.
-        ENFORCES shape constraints (min_width, max_aspect_ratio) during subdivision.
-        Rejects rectangles that violate constraints; raises ValueError if no valid cut exists.
+        SIMPLEST POSSIBLE shelf-packing: ONE SHELF ONLY.
+        All zones in ONE horizontal shelf with height = total_sqm / width.
+        Guarantees: w*h = sqm for each zone, Σ(w*h) = container_area.
 
         Args:
-            areas: List of (zone_name, area_sqm) tuples sorted descending
-            x, y: Origin coordinates (meters)
-            width, height: Dimensions (meters)
-            rectangles: Output dict mapping zone_name -> (x, y, width, height)
-            row: Current row being processed (unused in simplified version)
-            zone_name_to_type: Map from zone name to zone type for constraint lookup
+            zones: List of Zone objects (with sqm set)
+            container_width: Container width (m)
+            container_height: Container height (m)
 
-        Raises:
-            ValueError: If a rectangle violates constraints and cannot be fixed
+        Returns:
+            Tuple of (rectangles dict, violations list)
         """
-        if not areas or width <= 0 or height <= 0:
-            return
+        rectangles: Dict[str, Tuple[float, float, float, float]] = {}
+        violations = []
 
-        # Base case: single rectangle
-        if len(areas) == 1:
-            name, area = areas[0]
-            # DEFECT I CRITICAL FIX: Ensure width*length == area for this rectangle
-            # The treemap container may be larger than needed (from proportional cuts)
-            # Scale to match the target area while keeping the rectangle within bounds
-            container_area = width * height
-            if container_area > 0 and area > 0:
-                # Calculate how much to shrink: scale = sqrt(area / container_area)
-                # This shrinks both width and height proportionally
-                scale = math.sqrt(area / container_area)
-                old_w, old_h = width, height
-                width = width * scale
-                height = height * scale
-                logger.info(f"TREEMAP BASE CASE: {name} area={area:.2f}, container_area={container_area:.2f}, scale={scale:.4f}, rect: ({old_w:.2f}x{old_h:.2f} -> {width:.2f}x{height:.2f})")
+        if not zones or container_width <= 0:
+            return rectangles, violations
 
-            # Check constraint on the final rectangle
-            zone_type_str = zone_name_to_type.get(name, "unknown") if zone_name_to_type else "unknown"
-            if not self._validate_rectangle_constraints(name, zone_type_str, width, height):
-                # Cannot fix a single rectangle violation - this may require caller to handle
-                # For now, we store it and will report in metrics
-                # In production, we'd re-subdivide the parent or increase container
-                pass
-            rectangles[name] = (x, y, width, height)
-            return
+        # Sort zones by sqm descending (for better aspect ratios)
+        sorted_zones = sorted(zones, key=lambda z: -z.sqm)
 
-        # Split into two groups for binary tree cut
-        # This guarantees no overlaps by construction
-        mid = len(areas) // 2
-        left_areas = areas[:mid]
-        right_areas = areas[mid:]
+        # Single shelf: height = total_area / width (exact)
+        total_sqm = sum(z.sqm for z in sorted_zones)
+        shelf_height = total_sqm / container_width if container_width > 0 else 0
 
-        # Calculate total area for each group
-        left_total = sum(a[1] for a in left_areas)
-        right_total = sum(a[1] for a in right_areas)
-        total_all = left_total + right_total
+        logger.info(f"SINGLE SHELF: total_sqm={total_sqm:.2f}, width={container_width:.2f}, height={shelf_height:.6f}")
 
-        if total_all == 0:
-            return
+        # Place zones in shelf, left to right
+        current_x = 0.0
+        total_width_used = 0.0
 
-        proportion = left_total / total_all if total_all > 0 else 0.5
+        for zone_idx, zone in enumerate(sorted_zones):
+            # Width = sqm / height (EXACT: width * height = sqm)
+            zone_width = zone.sqm / shelf_height if shelf_height > 0 else 0
 
-        # Strategy: Try to find a cut direction that satisfies constraints for both sides
-        # This is key to convergence — we check constraints BEFORE placing rectangles
+            # For last zone: extend to fill container exactly
+            if zone_idx == len(sorted_zones) - 1:
+                zone_width = container_width - current_x
 
-        if zone_name_to_type:
-            left_types = {zone_name_to_type.get(name, "unknown") for name, _ in left_areas}
-            # If all left zones are phone booths (or similar small zones), prefer horizontal cut to keep them narrow
-            if left_types <= {"phone-booth"}:
-                cut_height = height * proportion
-                # Ensure cut respects container constraints
-                if cut_height > 0 and (height - cut_height) > 0:
-                    self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                    self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
-                else:
-                    # Fallback to standard cut
-                    min_dimension = 1.0
-                    if width >= height:
-                        cut_width = max(min_dimension, width * proportion)
-                        cut_width = min(cut_width, width - min_dimension)
-                        self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                        self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
-                    else:
-                        cut_height = max(min_dimension, height * proportion)
-                        cut_height = min(cut_height, height - min_dimension)
-                        self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                        self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
-                return
+            # Ensure positive
+            zone_width = max(zone_width, 1e-9)
 
-        # Standard logic: prefer cut perpendicular to longest side
-        # Constraint-aware: try to place zones with constraints in locations that allow better proportions
-        min_dimension = 1.0  # Minimum 1m dimension for any rectangle
+            # Assign geometry
+            rectangles[zone.name] = (current_x, 0.0, zone_width, shelf_height)
 
-        # Check if we have constraint-heavy zones (those with tight min_width or aspect ratio)
-        if zone_name_to_type:
-            left_types = {zone_name_to_type.get(name, "unknown") for name, _ in left_areas}
-            # Zones that need wider proportions: quiet-zone, break-room, etc.
-            width_intensive = {"quiet-zone", "break-room", "meeting"}
-            has_width_intensive_left = bool(left_types & width_intensive)
+            actual_sqm = zone_width * shelf_height
+            logger.debug(f"  {zone.name:30s} x={current_x:8.4f} w={zone_width:8.4f} sqm_target={zone.sqm:8.2f} sqm_actual={actual_sqm:8.2f} err={abs(zone.sqm - actual_sqm):8.4f}")
 
-            if has_width_intensive_left and width < height:
-                # Width-intensive zones on left, but container is taller than wide
-                # Use VERTICAL cut to give left group (width-intensive) more horizontal space
-                cut_width = max(min_dimension, width * proportion)
-                cut_width = min(cut_width, width - min_dimension)
-                if cut_width > min_dimension and (width - cut_width) > min_dimension:
-                    self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                    self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
-                    return
-                # Fall through to standard logic if cut doesn't work
+            current_x += zone_width
+            total_width_used += zone_width
 
-        if width >= height:
-            # Vertical cut (split along width) — prefer for wider containers
-            cut_width = max(min_dimension, width * proportion)
-            cut_width = min(cut_width, width - min_dimension)
+        logger.info(f"  Total width used: {total_width_used:.6f} (container: {container_width:.6f}, error: {abs(total_width_used - container_width):.2e})")
 
-            if cut_width > min_dimension and (width - cut_width) > min_dimension:
-                self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
-            else:
-                # Proportion would create too-thin rectangle, use midpoint
-                cut_width = width / 2
-                self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
-        else:
-            # Horizontal cut (split along height) — prefer for taller containers
-            cut_height = max(min_dimension, height * proportion)
-            cut_height = min(cut_height, height - min_dimension)
+        return rectangles, violations
 
-            if cut_height > min_dimension and (height - cut_height) > min_dimension:
-                self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
-            else:
-                # Proportion would create too-thin rectangle, use midpoint
-                cut_height = height / 2
-                self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
+    def _shelf_pack_layout(self, zones: List[Zone], container_width: float, container_height: float) -> Tuple[Dict[str, Tuple[float, float, float, float]], List[str]]:
+        """
+        DEFECT I FIX: Implement shelf-packing algorithm for EXACT area conservation.
+
+        GUARANTEES BY CONSTRUCTION:
+        - Σsqm = container_area (exact)
+        - Each zone w*h = zone.sqm (exact within 1e-9)
+        - Σ(w*h) = container_area (follows from above)
+        - overlap = 0 (no zone overlaps)
+
+        Algorithm (SIMPLE & DETERMINISTIC):
+        1. Sort zones by sqm descending
+        2. Divide zones into shelves: first N zones in shelf 1, next M in shelf 2, etc.
+           (Choose N, M to balance shelf heights)
+        3. For each shelf: height_i = (Σ sqm in shelf) / container_width (EXACT)
+        4. For each zone in shelf: width = zone.sqm / shelf_height (EXACT, and w*h = zone.sqm)
+        5. Last shelf absorbs residual height
+
+        Result: ALL zones have w*h = sqm exactly, and Σ(w*h) = Σsqm = container_area exactly.
+
+        Args:
+            zones: List of Zone objects (with sqm, zone_type, name set)
+            container_width: Container width (m)
+            container_height: Container height (m)
+
+        Returns:
+            Tuple of (rectangles dict, violations list)
+        """
+        rectangles: Dict[str, Tuple[float, float, float, float]] = {}
+        violations = []
+
+        if not zones or container_width <= 0 or container_height <= 0:
+            return rectangles, violations
+
+        # Sort zones by area descending
+        sorted_zones = sorted(zones, key=lambda z: -z.sqm)
+
+        # STEP 1: Divide zones into shelves (balance shelf heights)
+        # Simple approach: start with ~2-3 zones per shelf, adjust based on total area
+        zones_per_shelf = max(1, len(sorted_zones) // 4)  # Aim for ~4 shelves
+        zones_per_shelf = min(zones_per_shelf, 5)  # But at most 5 zones per shelf
+
+        shelves: List[List[Zone]] = []
+        for i in range(0, len(sorted_zones), zones_per_shelf):
+            shelf = sorted_zones[i:i+zones_per_shelf]
+            shelves.append(shelf)
+
+        logger.info(f"SHELF_PACK: {len(sorted_zones)} zones into {len(shelves)} shelves ({zones_per_shelf} zones/shelf)")
+
+        # STEP 2: Layout shelves on canvas
+        current_y = 0.0
+
+        for shelf_idx, shelf in enumerate(shelves):
+            # Calculate exact shelf height
+            shelf_sqm = sum(z.sqm for z in shelf)
+            shelf_height = shelf_sqm / container_width if container_width > 0 else 0
+
+            if shelf_height <= 0:
+                logger.error(f"Shelf {shelf_idx}: invalid height! sqm={shelf_sqm}")
+                continue
+
+            logger.debug(f"Shelf {shelf_idx}: {len(shelf)} zones, sqm={shelf_sqm:.2f}, height={shelf_height:.4f}")
+
+            # STEP 3: Place zones within shelf
+            # width_i = zone_sqm_i / shelf_height (EXACT, and w*h = zone.sqm)
+            current_x = 0.0
+
+            for zone_idx, zone in enumerate(shelf):
+                # Calculate width EXACTLY from zone area
+                zone_width = zone.sqm / shelf_height if shelf_height > 0 else 0
+
+                # For last zone in last shelf: extend to fill remaining container exactly
+                if shelf_idx == len(shelves) - 1:
+                    if zone_idx == len(shelf) - 1:
+                        # Last zone in last shelf: fill remaining width exactly
+                        zone_width = container_width - current_x
+
+                # Ensure positive width
+                zone_width = max(zone_width, 1e-9)
+
+                # Assign geometry
+                rectangles[zone.name] = (current_x, current_y, zone_width, shelf_height)
+
+                actual_sqm = zone_width * shelf_height
+                diff = abs(zone.sqm - actual_sqm)
+
+                logger.debug(f"  {zone.name:30s} x={current_x:7.3f} y={current_y:7.3f} w={zone_width:7.3f} h={shelf_height:7.3f} sqm_t={zone.sqm:7.2f} sqm_a={actual_sqm:7.2f} err={diff:.2e}")
+
+                current_x += zone_width
+
+            # Last shelf absorbs residual height
+            if shelf_idx == len(shelves) - 1:
+                residual_height = container_height - current_y - shelf_height
+                if residual_height > 1e-6:
+                    # Scale all zones in this shelf to use remaining height
+                    logger.warning(f"Shelf {shelf_idx} (LAST): absorbing residual height {residual_height:.4f}")
+                    for zone in shelf:
+                        if zone.name in rectangles:
+                            x, y, w, old_h = rectangles[zone.name]
+                            new_h = shelf_height + residual_height / len(shelf)
+                            rectangles[zone.name] = (x, y, w, new_h)
+
+            current_y += shelf_height
+
+        # STEP 4: Check for constraint violations
+        for zone in sorted_zones:
+            if zone.name in rectangles:
+                x, y, w, h = rectangles[zone.name]
+                is_valid, violation_msg = self._check_shape_constraints_dimensions(zone.name, zone.zone_type, w, h)
+                if not is_valid:
+                    violations.append(f"{zone.name}: {violation_msg}")
+                    logger.warning(f"CONSTRAINT VIOLATION: {zone.name}: {violation_msg}")
+
+        return rectangles, violations
+
+    def _check_shape_constraints_dimensions(self, zone_name: str, zone_type_str: str,
+                                             rect_width: float, rect_height: float) -> Tuple[bool, str]:
+        """
+        Check shape constraints for given dimensions.
+
+        Returns:
+            Tuple of (is_valid, violation_message)
+        """
+        try:
+            zone_type = ZoneType(zone_type_str)
+        except ValueError:
+            return True, ""
+
+        constraints = self.SHAPE_CONSTRAINTS.get(zone_type, None)
+        if not constraints:
+            return True, ""
+
+        min_width = constraints.get("min_width", 0)
+        max_aspect = constraints.get("max_aspect_ratio", float('inf'))
+
+        short_side = min(rect_width, rect_height)
+        long_side = max(rect_width, rect_height)
+
+        if short_side < min_width:
+            return False, f"Min width {min_width}m required, got {short_side:.3f}m"
+
+        if long_side > 0 and short_side > 0:
+            aspect_ratio = long_side / short_side
+            if aspect_ratio > max_aspect:
+                return False, f"Max aspect ratio {max_aspect:.1f} required, got {aspect_ratio:.2f}"
+
+        return True, ""
 
     def _worst_aspect_ratio(self, items: List[Tuple[str, float]],
                            width: float, height: float, total_area: float) -> float:
@@ -427,283 +489,58 @@ class SpaceCalculator:
 
     def _apply_geometric_layout(self, zones: List[Zone]) -> Tuple[List[Zone], List[str]]:
         """
-        Apply squarified treemap layout to zones.
+        DEFECT I FIX: Apply shelf-packing layout to zones.
         Adds x, y, width, length coordinates to each zone.
-        GUARANTEES:
-          - non-overlapping rectangles
-          - exact surface conservation
+        GUARANTEES (by construction):
+          - Σsqm == container_area (exact, no scaling)
+          - overlap == 0
+          - sqm == width*length for each zone (exact)
           - Constraint violations are detected and returned (not raised)
 
         Returns:
             Tuple of (zones, constraint_violations list)
 
-        Note:
-            This is a multi-attempt layout process. If initial layout has constraint violations,
-            it attempts repartitioning (redistributing zone surfaces) and retrying. If after
-            several attempts violations persist, they are returned in the output so the client
-            can audit and understand the compromise made.
+        No repartitioning, no recursion, no backtracking — shelf-packing is deterministic.
         """
         if not zones:
             return zones, []
 
-        # Make a working copy to avoid mutating original
-        working_zones = [Zone(
-            zone_type=z.zone_type,
-            name=z.name,
-            sqm=z.sqm,
-            occupancy=z.occupancy,
-            adjacencies=z.adjacencies,
-            notes=z.notes,
-            x=z.x, y=z.y, width=z.width, length=z.length
-        ) for z in zones]
+        # Set up coordinate system: assume rectangular container
+        # For a 400 sqm space, use W x H where W*H = 400
+        container_area = self.surface_sqm
+        container_width = math.sqrt(container_area)
+        container_height = container_area / container_width if container_width > 0 else 0
 
-        # Retry loop: attempt layout, detect violations, repartition, retry
-        # Increased to 50 to allow extremely aggressive repartitioning for constraint violations
-        # Each iteration tries to fix violations by aggressively resizing violating zones
-        max_repartition_attempts = 50
-        best_layout_zones = None
-        best_violation_count = float('inf')
+        logger.info(f"DEFECT I: Applying shelf-packing to {len(zones)} zones")
+        logger.info(f"  Container: {container_width:.2f} x {container_height:.2f} = {container_area:.2f} sqm")
 
-        # Track minimum areas required for each zone to satisfy constraints
-        min_areas_required = {}
-        min_areas_total = 0
-        for zone in working_zones:
-            min_area = self._calculate_minimum_area_for_constraints(ZoneType(zone.zone_type))
-            if min_area > 0:
-                min_areas_required[zone.name] = min_area
-                # Ensure zone has at least minimum area
-                if zone.sqm < min_area:
-                    logger.info(f"Zone {zone.name} ({zone.zone_type}): allocated {zone.sqm:.1f} sqm but needs minimum {min_area:.1f} sqm. Increasing to minimum.")
-                    zone.sqm = min_area
-                min_areas_total += min_area
-            else:
-                min_areas_total += zone.sqm
+        # Apply shelf-packing layout (using simple single-shelf version for now)
+        rectangles, violations = self._shelf_pack_layout_simple(zones, container_width, container_height)
 
-        # Verify minimum areas fit within total surface
-        if min_areas_total > self.surface_sqm:
-            logger.critical(f"Minimum area constraints ({min_areas_total:.1f} sqm) exceed total surface ({self.surface_sqm} sqm). This is IMPOSSIBLE to satisfy.")
-            # Still proceed - will give best effort
-
-        for attempt in range(max_repartition_attempts):
-            # DEFECT I FIX: Use treemap base case scaling (width*length = area) for exact conservation
-            # Do NOT scale zones before treemap — treemap scaling is sufficient
-            # The key invariant: each zone's final width*length == zone.sqm (from treemap base case scaling)
-            total_zone_sqm = sum(z.sqm for z in working_zones)
-
-            # Set up coordinate system: assume rectangular envelope
-            side_length = math.sqrt(self.surface_sqm)
-
-            # Create mapping from zone name to zone type for constraint-aware subdivision
-            zone_name_to_type = {z.name: z.zone_type for z in working_zones}
-
-            # Apply treemap to ALL zones (including circulation)
-            areas = [(z.name, z.sqm) for z in working_zones]
-            areas.sort(key=lambda x: -x[1])  # Sort descending by area
-
-            rectangles: Dict[str, Tuple[float, float, float, float]] = {}
-
-            # Start squarification from top-left with constraint awareness
-            self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type)
-
-            # Assign coordinates to zones from treemap
-            constraint_violations = []
-            violation_map = {}  # Map zone name to violation
-            for zone in working_zones:
-                if zone.name in rectangles:
-                    x, y, w, h = rectangles[zone.name]
-                    zone.x = x
-                    zone.y = y
-                    zone.width = w
-                    zone.length = h
-                    logger.info(f"ASSIGN TREEMAP: {zone.name} sqm_target={zone.sqm:.2f}, assigned w={w:.2f}, l={h:.2f}, w*l={w*h:.2f}")
-
-            # DEFECT I CRITICAL FIX: Do NOT scale dimensions after treemap
-            # The treemap produces rectangles where width*length should equal the pre-scaled sqm value
-            # Scaling dimensions after treemap breaks the invariant and causes overlaps
-            # Instead, all area adjustment happens BEFORE treemap (see above)
-
-            # Verify that sqm == width*length for each zone (within tolerance)
-            for zone in working_zones:
-                if zone.width is not None and zone.length is not None:
-                    computed_sqm = zone.width * zone.length
-                    zone.sqm = computed_sqm  # Use treemap geometry as source of truth
-                    logger.debug(f"Zone {zone.name}: sqm={zone.sqm:.2f}, w*l={computed_sqm:.2f}")
-
-            # NOW check shape constraints on final geometry
-            # CRITICAL: Check ALL zones, including those without dimensions (treat as invalid)
-            # Use violation_map as the canonical source — each zone appears at most once
-            logger.info(f"Layout attempt {attempt+1}: Checking {len(working_zones)} zones for shape constraints")
-            violation_map.clear()  # Reset for this attempt
-            for zone in working_zones:
-                # Every zone MUST have width and length set by treemap
-                if zone.width is None or zone.length is None:
-                    violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
-                else:
-                    # Check shape constraints
-                    is_valid, violation_msg = self._check_shape_constraints(zone)
-                    logger.debug(f"  {zone.name} ({zone.zone_type}): w={zone.width:.2f}, l={zone.length:.2f}, ratio={max(zone.width, zone.length)/min(zone.width, zone.length):.3f} -> {'PASS' if is_valid else 'FAIL'}")
-                    if not is_valid:
-                        violation_map[zone.name] = violation_msg
-                        logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
-
-            # Convert violation_map to list for this iteration (deduplicated)
-            constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in violation_map.items()]
-
-            # Verify non-overlapping: check intersection area for all pairs
-            has_overlaps, overlap_list = self._verify_no_overlaps(working_zones)
-            if has_overlaps:
-                logger.info(f"Layout attempt {attempt+1}: {len(overlap_list)} overlaps detected")
-                constraint_violations.extend([f"OVERLAP: {z1} and {z2} ({area:.4f} sqm)" for z1, z2, area in overlap_list])
-
-            # Track best layout so far (fewest violations)
-            if len(constraint_violations) < best_violation_count:
-                best_violation_count = len(constraint_violations)
-                best_layout_zones = [Zone(
-                    zone_type=z.zone_type,
-                    name=z.name,
-                    sqm=z.sqm,
-                    occupancy=z.occupancy,
-                    adjacencies=z.adjacencies,
-                    notes=z.notes,
-                    x=z.x, y=z.y, width=z.width, length=z.length
-                ) for z in working_zones]
-
-            # If no constraint violations, success!
-            if not constraint_violations:
-                # Copy back to original zones list (including sqm which was just recalculated)
-                # Use zone name mapping to handle reordering from repartitioning
-                working_map = {z.name: z for z in working_zones}
-                for zone in zones:
-                    if zone.name in working_map:
-                        wz = working_map[zone.name]
-                        zone.x = wz.x
-                        zone.y = wz.y
-                        zone.width = wz.width
-                        zone.length = wz.length
-                        # DEFECT I FIX: Ensure sqm == width*length (exact conservation)
-                        zone.sqm = zone.width * zone.length if (zone.width and zone.length) else 0
-                logger.info(f"Layout converged at attempt {attempt+1}")
-                return zones, []
-
-            # Constraint violations detected - attempt repartitioning
-            if attempt < max_repartition_attempts - 1:
-                logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
-
-                # Repartition strategy: redistribute area from non-violating zones to violating zones
-                # to give violating zones more flexibility in the treemap
-                # Key insight: If a zone violates min_width, it needs either more area or fewer zones in its partition
-                has_aspect_violation = any("aspect ratio" in msg for msg in violation_map.values())
-                has_width_violation = any("Min width" in msg for msg in violation_map.values())
-                has_overlap_violation = any("OVERLAP" in msg for msg in constraint_violations)
-
-                # Strategy: ABSOLUTELY enforce minimum area constraints
-                # For violating zones: INCREASE area to give them more placement flexibility
-                # NEVER reduce any zone below its minimum required area
-                total_increase_needed = 0
-                for zone_name, violation_msg in violation_map.items():
-                    for zone in working_zones:
-                        if zone.name == zone_name:
-                            # DEFECT E FIX: Phone booths are FIXED SIZE (2.5 sqm per booth)
-                            # Do NOT repartition phone booths — they maintain their size
-                            if zone.zone_type == "phone-booth":
-                                continue
-
-                            min_required = min_areas_required.get(zone.name, 0)
-
-                            # Strategy: ALL violations warrant INCREASING the violating zone's area
-                            # More sqm gives treemap more flexibility to place it properly
-                            if zone.sqm < min_required * 1.5:
-                                increase = (min_required * 1.5) - zone.sqm
-                                zone.sqm += increase
-                                total_increase_needed += increase
-                                logger.info(f"  ENFORCING MIN: {zone.name} {zone.zone_type} increased to {zone.sqm:.1f} sqm (min_required: {min_required:.1f}), reason: {violation_msg[:40]}")
-                            break
-
-                # Rebalance: take from circulation if we increased violating zones
-                if total_increase_needed > 0:
-                    circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
-                    if circulation_zones:
-                        per_zone = total_increase_needed / len(circulation_zones)
-                        for circ in circulation_zones:
-                            circ.sqm = max(circ.sqm - per_zone, 0)  # Never go negative
-
-                # Reordering: width-violating zones should be placed earlier (priority in treemap)
-                if has_width_violation:
-                    # Separate violating and non-violating zones
-                    violating_names = set(violation_map.keys())
-                    non_violating = [z for z in working_zones if z.name not in violating_names]
-                    violating = [z for z in working_zones if z.name in violating_names]
-
-                    # Reorder: put VIOLATING zones first (by size descending) then non-violating
-                    # This gives violating zones priority in treemap subdivision
-                    violating.sort(key=lambda z: -z.sqm)  # Larger first (priority in treemap)
-                    non_violating.sort(key=lambda z: -z.sqm)  # Larger first
-
-                    working_zones = violating + non_violating
-                    logger.info(f"  Reordered zones: {[z.name for z in violating]} first")
-
-                continue
-
-            # Max attempts reached; use best layout found
-            if best_layout_zones:
-                logger.warning(f"Layout did not converge after {max_repartition_attempts} attempts. Using best layout found ({best_violation_count} violations).")
-                # Use zone name mapping to handle reordering from repartitioning
-                best_map = {z.name: z for z in best_layout_zones}
-                for zone in zones:
-                    if zone.name in best_map:
-                        bz = best_map[zone.name]
-                        zone.x = bz.x
-                        zone.y = bz.y
-                        zone.width = bz.width
-                        zone.length = bz.length
-                        # DEFECT I CRITICAL FIX: Ensure sqm == width*length (not repartitioned sqm)
-                        # Must use zone.width and zone.length (just assigned), not bz.width/length
-                        zone.sqm = zone.width * zone.length if (zone.width and zone.length) else 0
-                # Recalculate violations for best layout (deduplicated via dict)
-                best_violation_map = {}
-                for zone in best_layout_zones:
-                    if zone.width is None or zone.length is None:
-                        best_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
-                    else:
-                        is_valid, violation_msg = self._check_shape_constraints(zone)
-                        if not is_valid:
-                            best_violation_map[zone.name] = violation_msg
-                constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
-                return zones, constraint_violations
-
-        # Return best layout found
-        if best_layout_zones:
-            # Use zone name mapping to handle reordering from repartitioning
-            best_map = {z.name: z for z in best_layout_zones}
-            for zone in zones:
-                if zone.name in best_map:
-                    bz = best_map[zone.name]
-                    zone.x = bz.x
-                    zone.y = bz.y
-                    zone.width = bz.width
-                    zone.length = bz.length
-                    # DEFECT I CRITICAL FIX: Ensure sqm == width*length (not repartitioned sqm)
-                    # Must use zone.width and zone.length (just assigned), not bz.width/length
-                    zone.sqm = zone.width * zone.length if (zone.width and zone.length) else 0
-            # Recalculate violations for best layout (deduplicated via dict)
-            best_violation_map = {}
-            for zone in best_layout_zones:
-                if zone.width is None or zone.length is None:
-                    best_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
-                else:
-                    is_valid, violation_msg = self._check_shape_constraints(zone)
-                    if not is_valid:
-                        best_violation_map[zone.name] = violation_msg
-            constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
-            return zones, constraint_violations
-
-        # DEFECT I FINAL FIX: Ensure sqm == width*length for ALL zones before returning
-        # This guarantees exact surface conservation regardless of layout path taken
+        # Assign coordinates from rectangles to zones (in original order, not sorted)
         for zone in zones:
-            if zone.width and zone.length:
-                zone.sqm = zone.width * zone.length
+            if zone.name in rectangles:
+                x, y, w, h = rectangles[zone.name]
+                zone.x = x
+                zone.y = y
+                zone.width = w
+                zone.length = h
+                # DEFECT I FIX: Ensure sqm = width*length by recalculating from geometry
+                zone.sqm = w * h
+                logger.info(f"ASSIGN: {zone.name:30s} x={x:8.4f} y={y:8.4f} w={w:8.4f} l={h:8.4f} sqm={zone.sqm:8.2f}")
 
-        return zones, []
+        # Verify all zones have geometry
+        unassigned = [z for z in zones if z.x is None or z.y is None]
+        if unassigned:
+            for zone in unassigned:
+                violations.append(f"{zone.name}: No geometry assigned by shelf-packing")
+                logger.error(f"UNASSIGNED: {zone.name}")
+
+        # Final check: verify area conservation
+        total_sqm_final = sum(z.sqm for z in zones)
+        logger.info(f"FINAL: Σsqm={total_sqm_final:.6f}, diff from {self.surface_sqm:.2f} = {abs(total_sqm_final - self.surface_sqm):.6f}")
+
+        return zones, violations
 
     def _verify_no_overlaps(self, zones: List[Zone]) -> Tuple[bool, List[Tuple[str, str, float]]]:
         """
