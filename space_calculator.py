@@ -515,20 +515,23 @@ class SpaceCalculator:
 
             # NOW check shape constraints on final geometry
             # CRITICAL: Check ALL zones, including those without dimensions (treat as invalid)
+            # Use violation_map as the canonical source — each zone appears at most once
             logger.info(f"Layout attempt {attempt+1}: Checking {len(working_zones)} zones for shape constraints")
+            violation_map.clear()  # Reset for this attempt
             for zone in working_zones:
                 # Every zone MUST have width and length set by treemap
                 if zone.width is None or zone.length is None:
-                    constraint_violations.append(f"{zone.name}: No geometry assigned (width={zone.width}, length={zone.length})")
-                    violation_map[zone.name] = "No geometry"
+                    violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
                 else:
                     # Check shape constraints
                     is_valid, violation_msg = self._check_shape_constraints(zone)
                     logger.debug(f"  {zone.name} ({zone.zone_type}): w={zone.width:.2f}, l={zone.length:.2f}, ratio={max(zone.width, zone.length)/min(zone.width, zone.length):.3f} -> {'PASS' if is_valid else 'FAIL'}")
                     if not is_valid:
-                        constraint_violations.append(f"{zone.name}: {violation_msg}")
                         violation_map[zone.name] = violation_msg
                         logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
+
+            # Convert violation_map to list for this iteration (deduplicated)
+            constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in violation_map.items()]
 
             # Verify non-overlapping: check intersection area for all pairs
             self._verify_no_overlaps(working_zones)
@@ -634,12 +637,16 @@ class SpaceCalculator:
                         zone.width = bz.width
                         zone.length = bz.length
                         zone.sqm = bz.sqm  # CRITICAL: also copy the recalculated sqm
-                # Recalculate violations for best layout
-                constraint_violations = []
+                # Recalculate violations for best layout (deduplicated via dict)
+                best_violation_map = {}
                 for zone in best_layout_zones:
-                    is_valid, violation_msg = self._check_shape_constraints(zone)
-                    if not is_valid:
-                        constraint_violations.append(f"{zone.name}: {violation_msg}")
+                    if zone.width is None or zone.length is None:
+                        best_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
+                    else:
+                        is_valid, violation_msg = self._check_shape_constraints(zone)
+                        if not is_valid:
+                            best_violation_map[zone.name] = violation_msg
+                constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
                 return zones, constraint_violations
 
         # Return best layout found
@@ -654,12 +661,16 @@ class SpaceCalculator:
                     zone.width = bz.width
                     zone.length = bz.length
                     zone.sqm = bz.sqm  # CRITICAL: also copy the recalculated sqm
-            # Recalculate violations for best layout
-            constraint_violations = []
+            # Recalculate violations for best layout (deduplicated via dict)
+            best_violation_map = {}
             for zone in best_layout_zones:
-                is_valid, violation_msg = self._check_shape_constraints(zone)
-                if not is_valid:
-                    constraint_violations.append(f"{zone.name}: {violation_msg}")
+                if zone.width is None or zone.length is None:
+                    best_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
+                else:
+                    is_valid, violation_msg = self._check_shape_constraints(zone)
+                    if not is_valid:
+                        best_violation_map[zone.name] = violation_msg
+            constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
             return zones, constraint_violations
 
         return zones, []
