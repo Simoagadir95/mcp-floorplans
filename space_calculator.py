@@ -566,7 +566,9 @@ class SpaceCalculator:
                 else:
                     # Check shape constraints
                     is_valid, violation_msg = self._check_shape_constraints(zone)
-                    logger.debug(f"  {zone.name} ({zone.zone_type}): w={zone.width:.2f}, l={zone.length:.2f}, ratio={max(zone.width, zone.length)/min(zone.width, zone.length):.3f} -> {'PASS' if is_valid else 'FAIL'}")
+                    min_dim = min(zone.width, zone.length) if zone.width and zone.length else 0
+                    ratio = max(zone.width, zone.length)/min_dim if min_dim > 0 else 0
+                    logger.debug(f"  {zone.name} ({zone.zone_type}): w={zone.width:.2f}, l={zone.length:.2f}, ratio={ratio:.3f} -> {'PASS' if is_valid else 'FAIL'}")
                     if not is_valid:
                         violation_map[zone.name] = violation_msg
                         logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
