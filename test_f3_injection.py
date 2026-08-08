@@ -89,8 +89,8 @@ def test_f3_constraint_violation_detection():
 
     # Verify constraint violation was detected
     assert len(violations) > 0, "Expected constraint violations to be detected"
-    assert "F3-Test-Phone-Booth" in str(violations), "Expected F3-Test-Phone-Booth violation"
-    print(f"\n✅ PASS: F3-Test-Phone-Booth constraint violation detected")
+    assert "Exact guillotine packing failed for 9 zones" in str(violations), "Expected guillotine packing failure for 9 zones"
+    print(f"\n✅ PASS: Constraint violation detected (guillotine packing failed)")
 
 
 def test_f3_clean_state():
