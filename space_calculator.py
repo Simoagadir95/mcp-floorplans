@@ -114,13 +114,10 @@ class SpaceCalculator:
     #   - Quiet zone: 2.5m min, 3.0x max (focus areas need space)
     #   - Break room: 1.8m min, 4.0x max (more flexible)
     #   - Storage: 1.5m min, 3.0x max
-    #   - Circulation: 1.0m min, 10.0x max (corridors and common areas can be thin/long in constrained spaces)
-    # CYCLE 30 FIX: Increased circulation max_aspect from 5.0 to 10.0
-    # CYCLE 31 FIX: Further increased circulation max_aspect to 15.0
-    # Justification: In tight 20x20 bounds with many constrained zones, circulation often needs
-    # to fit as long thin corridors. Realistic office corridors are 1.5-2.5m wide x 15-30m long (ratio 6-20).
-    # For low_collab (focus-intensive) layouts with multiple constrained zones, 15.0 is realistic.
-    # Circulation is a flexible zone (corridors, restrooms, common areas) and can be elongated.
+    #   - Circulation: 1.0m min, 5.0x max
+    # NOTE: cycles 30/31 raised this to 10.0 then 15.0 to make a failing layout pass.
+    # Reverted: relaxing a business threshold to absorb a geometry defect is forbidden.
+    # The canonical value is 5.0 and is not to be changed without an explicit user decision.
     SHAPE_CONSTRAINTS = {
         ZoneType.OPEN_SPACE: {"min_width": 3.0, "max_aspect_ratio": 3.0},
         ZoneType.MEETING: {"min_width": 2.5, "max_aspect_ratio": 2.5},
@@ -128,7 +125,7 @@ class SpaceCalculator:
         ZoneType.QUIET_ZONE: {"min_width": 2.5, "max_aspect_ratio": 3.0},
         ZoneType.BREAK_ROOM: {"min_width": 1.8, "max_aspect_ratio": 4.0},
         ZoneType.STORAGE: {"min_width": 1.5, "max_aspect_ratio": 3.0},
-        ZoneType.CIRCULATION: {"min_width": 1.0, "max_aspect_ratio": 15.0},
+        ZoneType.CIRCULATION: {"min_width": 1.0, "max_aspect_ratio": 5.0},
     }
 
     # Collaboration percentages (target % of space for collaborative zones)
@@ -153,15 +150,10 @@ class SpaceCalculator:
         self.headcount = headcount
         self.zone_types = [ZoneType(zt) if isinstance(zt, str) else zt for zt in zone_types]
         self.collaboration_style = collaboration_style
-        # CYCLE 30 FIX: Reduce circulation for focus-intensive (low_collab) layouts to prevent overlap
-        # low_collab has constrained zone requirements (meeting, quiet, break all at minimum)
-        # This leaves large circulation that violates aspect ratio in tight 20x20 bounds
-        # Solution: use 8% circulation for low_collab (vs 15% for balanced/high-collab)
-        # With 8%, circulation = 32 sqm which can fit as ~20m x 1.6m (aspect 12.5) or better
-        if collaboration_style == "low_collab":
-            self.circulation_pct = 0.08  # 8% for focus-intensive layouts
-        else:
-            self.circulation_pct = 0.15  # 15% for balanced and collaboration-heavy layouts
+        # NOTE: cycle 30 cut circulation to 8% for low_collab so an out-of-bounds zone
+        # would shrink enough to fit. Reverted: shrinking a zone's programmed surface to
+        # absorb a placement defect is forbidden. Circulation stays at 15% for every style.
+        self.circulation_pct = 0.15  # 15% for corridors, stairs, etc.
         self.circulation_tolerance = 0.001  # DEFECT I FIX: Reduced from 0.02 to 0.001 (0.4 sqm on 400 sqm) for exact surface conservation
 
     def _squarify_treemap(self, areas: List[Tuple[str, float]],
