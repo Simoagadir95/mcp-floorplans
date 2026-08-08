@@ -1393,9 +1393,21 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
     for v in variants:
         logger.critical(f"  {v.variant_id}: {len(v.constraint_violations)} violations")
 
+    # DEFECT F3 FIX: Aggregate violations at root level
+    # Calculate total violations across all variants
+    total_violations = []
+    total_violation_count = 0
+    for v in variants:
+        violations = v.constraint_violations if v.constraint_violations else []
+        total_violations.extend(violations)
+        total_violation_count += len(violations)
+
     layout_data = {
         "project_id": project_id,
         "brief": calc.to_dict(),
+        "constraint_violations": total_violations,  # Root-level violations (sum of all variants)
+        "is_valid": total_violation_count == 0,      # True if all variants pass all constraints
+        "total_violations": total_violation_count,   # Count of violations across all variants
         "variants": [
             {
                 "variant_id": v.variant_id,
@@ -1405,6 +1417,7 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
                 "metrics": asdict(v.metrics),
                 "design_notes": v.design_notes,
                 "constraint_violations": v.constraint_violations if v.constraint_violations else [],
+                "variant_is_valid": len(v.constraint_violations if v.constraint_violations else []) == 0,
             }
             for v in variants
         ]
