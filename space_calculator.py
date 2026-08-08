@@ -305,10 +305,11 @@ class SpaceCalculator:
                 logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_height={row_height:.3f} but only {height:.3f} available - placing anyway for constraint detection")
 
             # CIRCULATION OVERFLOW FIX: Check absolute position bounds (y+height <= 20.0)
-            # Prevent zones from overflowing the floorplan's absolute boundary
+            # DEFECT J-1 FIX: Prevent zones from overflowing the floorplan's absolute boundary
+            # If zone would overflow, reject it and force repartitioning
             absolute_max = 20.0
             if y + row_height > absolute_max + 1e-3 and len(row) > 1:
-                logger.warning(f"CIRCULATION OVERFLOW CHECK: y={y:.3f} + row_height={row_height:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
+                logger.warning(f"DEFECT J-1 FIX: y={y:.3f} + row_height={row_height:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
                 while y + row_height > absolute_max + 1e-3 and len(row) > 1:
                     smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
                     removed_name, removed_area = row.pop(smallest_idx)
@@ -316,7 +317,7 @@ class SpaceCalculator:
                     row_height = row_total_area / width if width > 0 else 0
                     logger.debug(f"Removed {removed_name} (area={removed_area:.3f}) for overflow, new y+height={y + row_height:.3f}")
             elif y + row_height > absolute_max + 1e-3 and len(row) == 1:
-                logger.warning(f"CIRCULATION OVERFLOW CHECK: Single zone overflow: y={y:.3f} + height={row_height:.3f} = {y + row_height:.3f} exceeds {absolute_max} - placing anyway for constraint detection")
+                logger.warning(f"DEFECT J-1: Single zone overflow: y={y:.3f} + height={row_height:.3f} = {y + row_height:.3f} exceeds {absolute_max} - will be caught by constraint checker")
 
             if not row:
                 # All zones were removed - shouldn't happen but handle gracefully
@@ -405,10 +406,11 @@ class SpaceCalculator:
                 logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_width={row_width:.3f} but only {width:.3f} available - placing anyway for constraint detection")
 
             # CIRCULATION OVERFLOW FIX: Check absolute position bounds (x+width <= 20.0)
-            # Prevent zones from overflowing the floorplan's absolute boundary
+            # DEFECT J-1 FIX: Prevent zones from overflowing the floorplan's absolute boundary
+            # If zone would overflow, reject it and force repartitioning
             absolute_max = 20.0
             if x + row_width > absolute_max + 1e-3 and len(row) > 1:
-                logger.warning(f"CIRCULATION OVERFLOW CHECK: x={x:.3f} + row_width={row_width:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
+                logger.warning(f"DEFECT J-1 FIX: x={x:.3f} + row_width={row_width:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
                 while x + row_width > absolute_max + 1e-3 and len(row) > 1:
                     smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
                     removed_name, removed_area = row.pop(smallest_idx)
@@ -416,7 +418,7 @@ class SpaceCalculator:
                     row_width = row_total_area / height if height > 0 else 0
                     logger.debug(f"Removed {removed_name} (area={removed_area:.3f}) for overflow, new x+width={x + row_width:.3f}")
             elif x + row_width > absolute_max + 1e-3 and len(row) == 1:
-                logger.warning(f"CIRCULATION OVERFLOW CHECK: Single zone overflow: x={x:.3f} + width={row_width:.3f} = {x + row_width:.3f} exceeds {absolute_max} - placing anyway for constraint detection")
+                logger.warning(f"DEFECT J-1: Single zone overflow: x={x:.3f} + width={row_width:.3f} = {x + row_width:.3f} exceeds {absolute_max} - will be caught by constraint checker")
 
             if not row:
                 # All zones were removed - shouldn't happen but handle gracefully
@@ -855,19 +857,26 @@ class SpaceCalculator:
             # NOW check shape constraints on final geometry
             # CRITICAL: Check ALL zones, including those without dimensions (treat as invalid)
             # Use violation_map as the canonical source — each zone appears at most once
+            # DEFECT F3 FIX: NEVER CLEAR VIOLATIONS — violations must propagate to API response
             logger.info(f"Layout attempt {attempt+1}: Checking {len(working_zones)} zones for shape constraints")
-            violation_map.clear()  # Reset for this attempt
+            # DO NOT clear violation_map from previous attempts if this attempt has violations
+            # Instead, we accumulate best violations across all attempts
+            attempt_violation_map = {}
             for zone in working_zones:
                 # Every zone MUST have width and length set by treemap
                 if zone.width is None or zone.length is None:
-                    violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
+                    attempt_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
                 else:
-                    # Check shape constraints
+                    # Check shape constraints — DEFECT F3: must be called on final geometry
                     is_valid, violation_msg = self._check_shape_constraints(zone)
                     min_dim = min(zone.width, zone.length) if zone.width and zone.length else 0
                     ratio = max(zone.width, zone.length)/min_dim if min_dim > 0 else 0
                     logger.debug(f"  {zone.name} ({zone.zone_type}): w={zone.width:.2f}, l={zone.length:.2f}, ratio={ratio:.3f} -> {'PASS' if is_valid else 'FAIL'}")
                     if not is_valid:
+                        # DEFECT F3 FIX: Record violation BEFORE attempting fix
+                        attempt_violation_map[zone.name] = violation_msg
+                        logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
+
                         # DEFECT I-2 FIX: Try to fix constraint violation while preserving area
                         # If we can fix it, remove from violations; otherwise keep it
                         fixed = self._fix_constraint_violation(zone)
@@ -875,13 +884,15 @@ class SpaceCalculator:
                             # Re-check after fix
                             is_valid, violation_msg = self._check_shape_constraints(zone)
                             if is_valid:
+                                # Successfully fixed — remove from violation map
+                                del attempt_violation_map[zone.name]
                                 logger.info(f"Fixed constraint violation for {zone.name} while preserving area")
                             else:
-                                violation_map[zone.name] = violation_msg
+                                # Still violates after fix — update with new message
+                                attempt_violation_map[zone.name] = violation_msg
                                 logger.info(f"Still violates after fix: {zone.name} ({zone.zone_type}): {violation_msg}")
-                        else:
-                            violation_map[zone.name] = violation_msg
-                            logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
+
+            violation_map = attempt_violation_map  # Use attempt violations for this iteration
 
             # Convert violation_map to list for this iteration (deduplicated)
             constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in violation_map.items()]
@@ -1045,7 +1056,7 @@ class SpaceCalculator:
                     zone.length = bz.length
                     # Keep the programmed sqm value (source of truth)
                     zone.sqm = bz.sqm  # Use best layout's sqm (which is programmed value)
-            # Recalculate violations for best layout (deduplicated via dict)
+            # DEFECT F3 FIX: Recalculate violations for best layout AND ensure they're returned
             best_violation_map = {}
             for zone in best_layout_zones:
                 if zone.width is None or zone.length is None:
@@ -1054,7 +1065,10 @@ class SpaceCalculator:
                     is_valid, violation_msg = self._check_shape_constraints(zone)
                     if not is_valid:
                         best_violation_map[zone.name] = violation_msg
+                        logger.warning(f"DEFECT F3: Final violation in best layout: {zone.name}: {violation_msg}")
             constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
+            if constraint_violations:
+                logger.critical(f"_apply_geometric_layout: returning best layout with {len(constraint_violations)} violations: {constraint_violations}")
             return zones, constraint_violations
 
         # Fallback: if we have no layout at all, don't try to recalculate sqm
@@ -1066,22 +1080,22 @@ class SpaceCalculator:
                 if zone.width and zone.length:
                     zone.sqm = zone.width * zone.length
 
-        # Return best layout found during attempts (may have violations)
-        if best_violation_count > 0:
-            logger.error(f"_apply_geometric_layout: exhausted {max_repartition_attempts} attempts without full convergence. Returning best layout with {best_violation_count} violations.")
-            # Recalculate violations for the best layout to return them
-            final_violations = []
-            for zone in zones:
-                if zone.width is None or zone.length is None:
-                    final_violations.append(f"{zone.name}: No geometry assigned")
-                else:
-                    is_valid, violation_msg = self._check_shape_constraints(zone)
-                    if not is_valid:
-                        final_violations.append(f"{zone.name}: {violation_msg}")
-            return zones, final_violations
-        else:
-            logger.info("_apply_geometric_layout: returned best layout with zero violations")
-            return zones, []
+        # DEFECT F3 FIX: ALWAYS check and return violations from final zones
+        # This is the last resort — ensure violations are never silently dropped
+        logger.error(f"_apply_geometric_layout: exhausted {max_repartition_attempts} attempts without finding a valid layout.")
+        final_violations = []
+        for zone in zones:
+            if zone.width is None or zone.length is None:
+                final_violations.append(f"{zone.name}: No geometry assigned")
+                logger.warning(f"DEFECT F3: Zone without geometry: {zone.name}")
+            else:
+                is_valid, violation_msg = self._check_shape_constraints(zone)
+                if not is_valid:
+                    final_violations.append(f"{zone.name}: {violation_msg}")
+                    logger.warning(f"DEFECT F3: Final zone violation: {zone.name}: {violation_msg}")
+        if final_violations:
+            logger.critical(f"_apply_geometric_layout: returning final layout with {len(final_violations)} violations: {final_violations}")
+        return zones, final_violations
 
     def _verify_no_overlaps(self, zones: List[Zone]) -> Tuple[bool, List[Tuple[str, str, float]]]:
         """
@@ -1671,8 +1685,29 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
     # Calculate total violations across all variants
     total_violations = []
     total_violation_count = 0
+
+    # Re-validate ALL zones to ensure violations are caught (belt-and-suspenders approach)
+    # This catches any violations that might have been missed during layout
+    logger.info(f"DEFECT F3: Re-validating all zones in all variants before returning API response")
+
     for v in variants:
         violations = v.constraint_violations if v.constraint_violations else []
+        logger.info(f"  {v.variant_id}: reported violations={len(violations)}")
+
+        # DEFECT F3 FIX: Re-check every zone against constraints
+        re_validated_violations = []
+        for zone in v.zones:
+            is_valid, violation_msg = calc._check_shape_constraints(zone)
+            if not is_valid:
+                violation_str = f"{zone.name} ({zone.zone_type}): {violation_msg}"
+                re_validated_violations.append(violation_str)
+                logger.warning(f"DEFECT F3: Re-validation caught violation: {violation_str}")
+
+        # Use re-validated violations if they differ from reported ones
+        if len(re_validated_violations) != len(violations):
+            logger.warning(f"DEFECT F3: Violation count mismatch for {v.variant_id}: reported={len(violations)}, re-validated={len(re_validated_violations)}")
+            violations = re_validated_violations
+
         total_violations.extend(violations)
         total_violation_count += len(violations)
 
