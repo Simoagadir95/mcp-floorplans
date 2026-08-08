@@ -461,57 +461,39 @@ class SpaceCalculator:
         success = self._guillotine_cut(areas, 0, 0, side_length, side_length, rectangles, zone_name_to_type, depth=0)
 
         if not success:
-            # Fallback: Deterministic row-packing with FULL surface conservation
-            # Allocates equal-height rows; each row distributes zones equally across width
-            logger.debug(f"Guillotine did not converge for {len(areas)} zones, using deterministic row allocation")
+            # No silent fallback — explicit error with actionable suggestions
+            logger.error(f"GUILLOTINE FAILED: Cannot partition {len(areas)} zones into {side_length:.2f}x{side_length:.2f} container")
 
-            rectangles = {}
-            num_zones = len(areas)
-            num_rows = max(1, math.ceil(math.sqrt(num_zones)))
-            fixed_row_height = side_length / num_rows
-
-            # Phase 1: Group zones into rows
-            rows = [[] for _ in range(num_rows)]
-            row_idx = 0
-            zones_in_row = 0
-            target_per_row = max(1, math.ceil(num_zones / num_rows))
-
+            # Build actionable error message with adjustment suggestions
+            zone_count = len(areas)
+            zone_types_in_layout = {}
             for name, area in areas:
-                rows[row_idx].append((name, area))
-                zones_in_row += 1
+                zone_type = zone_name_to_type.get(name, "unknown")
+                if zone_type not in zone_types_in_layout:
+                    zone_types_in_layout[zone_type] = 0
+                zone_types_in_layout[zone_type] += 1
 
-                if zones_in_row >= target_per_row and row_idx < num_rows - 1:
-                    row_idx += 1
-                    zones_in_row = 0
+            suggestions = []
+            suggestions.append(f"Current layout: {zone_count} zones ({', '.join([f'{count} {zt}' for zt, count in zone_types_in_layout.items()])})")
+            suggestions.append(f"Container: {side_length:.1f}m × {side_length:.1f}m = {self.surface_sqm:.1f} sqm")
+            suggestions.append(f"Zone sizing constraints violated:")
 
-            # Phase 2: Place zones with equal column widths per row
-            for row_idx, zone_list in enumerate(rows):
-                if not zone_list:
-                    continue
+            # Check which zones are problematic
+            for zt, count in zone_types_in_layout.items():
+                try:
+                    zone_type_enum = ZoneType(zt)
+                    constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum, {})
+                    min_width = constraints.get("min_width", 0)
+                    max_aspect = constraints.get("max_aspect_ratio", float('inf'))
+                    min_area = self._calculate_minimum_area_for_constraints(zone_type_enum)
+                    suggestions.append(f"  • {zt}: min_area={min_area:.1f} sqm, min_width={min_width}m, max_aspect={max_aspect}")
+                except:
+                    pass
 
-                num_cols = len(zone_list)
-                col_width = side_length / num_cols
-                y_pos = row_idx * fixed_row_height
-                zone_height = fixed_row_height
+            suggestions.append(f"\nAdjustment options: (1) Reduce zone count: merge {zone_count} zones into fewer zones; (2) Increase surface: expand from {self.surface_sqm:.1f} to >{self.surface_sqm*1.2:.1f} sqm; (3) Relax zone types: remove high-constraint zones (phone-booth, meeting)")
 
-                # Adjust height for last row to fill remaining space
-                if row_idx == num_rows - 1:
-                    zone_height = side_length - y_pos
-
-                for col_idx, (zname, zarea) in enumerate(zone_list):
-                    x_pos = col_idx * col_width
-                    zone_width = col_width
-
-                    # Last column in row fills remaining width
-                    if col_idx == num_cols - 1:
-                        zone_width = side_length - x_pos
-
-                    zone_width = max(0.5, zone_width)
-                    zone_height = max(0.5, zone_height)
-
-                    rectangles[zname] = (x_pos, y_pos, zone_width, zone_height)
-
-            logger.debug(f"Row allocation: placed {len(rectangles)} zones in {num_rows} rows with perfect surface conservation")
+            error_msg = f"GUILLOTINE LAYOUT FAILED: Cannot partition workspace with {zone_count} zones. " + " | ".join(suggestions)
+            raise ValueError(error_msg)
 
         # Assign coordinates from guillotine output
         for zone in working_zones:
