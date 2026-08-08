@@ -1189,6 +1189,34 @@ class SpaceCalculator:
                 if zone.width and zone.length:
                     zone.sqm = zone.width * zone.length
 
+        # DEFECT D FIX (FINAL): Final boundary clipping pass to ensure no zones overflow 20x20 bounds
+        # This is the very last step before returning, catching any remaining boundary violations
+        boundary_max = 20.0
+        for zone in zones:
+            if zone.x is not None and zone.width is not None:
+                if zone.x + zone.width > boundary_max + 1e-6:
+                    available_width = boundary_max - zone.x
+                    if available_width > 0 and zone.sqm is not None:
+                        new_length = zone.sqm / available_width
+                        logger.warning(
+                            f"DEFECT D FIX (FINAL): {zone.name} width overflow: x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
+                            f"Final clip: new_width={available_width:.3f}, new_length={new_length:.3f}"
+                        )
+                        zone.width = available_width
+                        zone.length = new_length
+
+            if zone.y is not None and zone.length is not None:
+                if zone.y + zone.length > boundary_max + 1e-6:
+                    available_length = boundary_max - zone.y
+                    if available_length > 0 and zone.sqm is not None:
+                        new_width = zone.sqm / available_length
+                        logger.warning(
+                            f"DEFECT D FIX (FINAL): {zone.name} length overflow: y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
+                            f"Final clip: new_length={available_length:.3f}, new_width={new_width:.3f}"
+                        )
+                        zone.width = new_width
+                        zone.length = available_length
+
         # DEFECT F3 FIX: ALWAYS check and return violations from final zones
         # This is the last resort — ensure violations are never silently dropped
         logger.error(f"_apply_geometric_layout: exhausted {max_repartition_attempts} attempts without finding a valid layout.")
