@@ -444,12 +444,24 @@ class SpaceCalculator:
     def _check_shape_constraints(self, zone: Zone) -> Tuple[bool, str]:
         """
         Check if a zone's dimensions satisfy shape constraints.
+        Validates BOTH shape constraints AND area conservation.
 
         Returns:
             Tuple of (is_valid, violation_description)
         """
         if zone.width is None or zone.length is None:
             return True, ""
+
+        # DEFECT I-2 FIX: Check area conservation
+        # A zone is valid ONLY if its rectangle area matches its programmed sqm value (within tolerance)
+        if zone.sqm is not None and zone.sqm > 0:
+            computed_area = zone.width * zone.length
+            area_error = abs(computed_area - zone.sqm)
+            tolerance = 1e-6 * zone.sqm  # Relative tolerance: 1 millionth of the zone's sqm
+            tolerance = max(tolerance, 0.01)  # But at least 0.01 sqm absolute tolerance
+
+            if area_error > tolerance:
+                return False, f"Area mismatch: programmed {zone.sqm:.2f} sqm, geometry {computed_area:.2f} sqm (error {area_error:.6f})"
 
         try:
             zone_type_enum = ZoneType(zone.zone_type)
