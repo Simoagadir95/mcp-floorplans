@@ -1707,6 +1707,8 @@ def generate_space_layouts_json(surface_sqm: float, headcount: int,
         if len(re_validated_violations) != len(violations):
             logger.warning(f"DEFECT F3: Violation count mismatch for {v.variant_id}: reported={len(violations)}, re-validated={len(re_validated_violations)}")
             violations = re_validated_violations
+            # DEFECT F3 FIX: UPDATE the variant's constraint_violations with re-validated ones
+            v.constraint_violations = violations
 
         total_violations.extend(violations)
         total_violation_count += len(violations)
