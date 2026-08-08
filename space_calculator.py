@@ -331,6 +331,10 @@ class SpaceCalculator:
                     row.clear()
                     return 0.0
 
+            # Note: BLOCAGE 1 FIX removed aggressive pre-placement validation.
+            # Instead, rely on post-placement constraint checking and repartitioning.
+            # Pre-placement validation was too strict and caused zones to never be placed.
+
             # CIRCULATION OVERFLOW FIX: Check absolute position bounds (y+height <= canvas_boundary)
             # For multi-zone rows, ensure they don't overflow
             # CYCLE 31 FIX: Use dynamic canvas_boundary instead of hardcoded 20.0
@@ -448,6 +452,56 @@ class SpaceCalculator:
                     # Clear row so main loop gets 0 and repartitions
                     row.clear()
                     return 0.0
+
+            # BLOCAGE 1 FIX: Validate aspect ratio constraints BEFORE placing zones (vertical layout)
+            # For each zone in the column, verify it will satisfy its shape constraints at this row width
+            # A zone with area A in a column of width W will have height = A/W and aspect_ratio = W / (A/W) = W²/A
+            # The zone violates constraint if W²/A > max_aspect_ratio, i.e., W > sqrt(A * max_aspect_ratio)
+            # OR if the short side doesn't meet min_width (similar logic to horizontal)
+            for zone_name, zone_area in row:
+                zone_type_str = zone_name_to_type.get(zone_name) if zone_name_to_type else None
+                if zone_type_str:
+                    # For vertical layout, calculate constraints based on width
+                    try:
+                        zone_type_enum = ZoneType(zone_type_str)
+                        constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum)
+                        if constraints:
+                            min_width_constraint = constraints.get("min_width", 0)
+                            max_aspect = constraints.get("max_aspect_ratio", float('inf'))
+
+                            # Zone height in this column = zone_area / row_width
+                            zone_height = zone_area / row_width if row_width > 0 else 0
+                            # Short side = min(row_width, zone_height)
+                            short_side = min(row_width, zone_height)
+                            long_side = max(row_width, zone_height)
+
+                            # Check aspect ratio
+                            if short_side > 0:
+                                aspect_ratio = long_side / short_side
+                                if aspect_ratio > max_aspect + 1e-6:
+                                    logger.warning(f"BLOCAGE 1 FIX (VERTICAL): Zone {zone_name} ({zone_area:.2f} sqm, type {zone_type_str}) "
+                                                 f"would have aspect_ratio {aspect_ratio:.2f} > max {max_aspect:.1f} at row_width {row_width:.3f}. "
+                                                 f"Removing from row to trigger repartitioning.")
+                                    row.remove((zone_name, zone_area))
+                                    row_total_area -= zone_area
+                                    if row:
+                                        row_width = row_total_area / height if height > 0 else 0
+                                    else:
+                                        return 0.0  # No zones left in row
+
+                            # Check min_width on short side
+                            if short_side < min_width_constraint - 1e-6:
+                                logger.warning(f"BLOCAGE 1 FIX (VERTICAL): Zone {zone_name} ({zone_area:.2f} sqm, type {zone_type_str}) "
+                                             f"would have short_side {short_side:.3f} < min_width {min_width_constraint} at row_width {row_width:.3f}. "
+                                             f"Removing from row to trigger repartitioning.")
+                                row.remove((zone_name, zone_area))
+                                row_total_area -= zone_area
+                                if row:
+                                    row_width = row_total_area / height if height > 0 else 0
+                                else:
+                                    return 0.0  # No zones left in row
+                    except (ValueError, KeyError):
+                        pass  # Unknown zone type, skip validation
 
             # CIRCULATION OVERFLOW FIX: Check absolute position bounds (x+width <= canvas_boundary)
             # For multi-zone rows, ensure they don't overflow
@@ -705,6 +759,86 @@ class SpaceCalculator:
 
         return True, ""
 
+    def _minimum_row_height_for_zone(self, zone_name: str, zone_sqm: float,
+                                      zone_type: str, row_width: float) -> float:
+        """
+        Calculate the MINIMUM row height needed to place a zone in a horizontal row
+        while satisfying its shape constraints.
+
+        For a zone with area A placed in a row of width W and height H:
+        - The zone will occupy width_i = A / H (conserving area)
+        - Aspect ratio = width_i / H = A / (H * H)
+        - For aspect_ratio <= R: A / H² <= R, so H >= sqrt(A / R)
+
+        Additionally, the zone must satisfy min_width constraint on its SHORT SIDE.
+        The short side is min(width_i, H). We need:
+        - min(A/H, H) >= min_width
+
+        Args:
+            zone_name: Name of the zone (for logging)
+            zone_sqm: Zone area in sqm
+            zone_type: Zone type string (e.g., "circulation")
+            row_width: Total width available in the row (used for other zones)
+
+        Returns:
+            Minimum row height needed for this zone to fit its constraints.
+            If returns 0, the zone cannot fit in a horizontal row (needs repartitioning).
+        """
+        try:
+            zone_type_enum = ZoneType(zone_type)
+        except (ValueError, KeyError):
+            return 0  # Unknown type, cannot calculate
+
+        constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum)
+        if not constraints:
+            return 0
+
+        min_width = constraints.get("min_width", 0)
+        max_aspect = constraints.get("max_aspect_ratio", float('inf'))
+
+        # Constraint 1: Aspect ratio
+        # For a zone in a row of height H: width = area / H
+        # Aspect ratio = (area / H) / H = area / H²
+        # For this to satisfy: area / H² <= max_aspect
+        # We need: H² >= area / max_aspect
+        # Therefore: H >= sqrt(area / max_aspect)
+        min_height_for_aspect = math.sqrt(zone_sqm / max_aspect) if max_aspect > 0 else 0
+
+        # Constraint 2: Minimum width on short side
+        # In a horizontal row, the zone width = zone_sqm / row_height
+        # The short side is min(zone_width, row_height) = min(zone_sqm / H, H)
+        # We need: min(zone_sqm / H, H) >= min_width
+
+        # Case 1: zone_sqm / H >= H (i.e., zone is wider than tall)
+        # Then short_side = H, and we need H >= min_width
+        # This gives H >= min_width
+
+        # Case 2: zone_sqm / H < H (i.e., zone is taller than wide)
+        # Then short_side = zone_sqm / H, and we need zone_sqm / H >= min_width
+        # This gives H <= zone_sqm / min_width
+
+        # Combined constraint: max(min_width, sqrt(zone_sqm / max_aspect)) <= H <= zone_sqm / min_width
+        # (when min_width > 0)
+
+        min_height_for_short_side = max(min_width, math.sqrt(zone_sqm))
+
+        # The zone can only fit in a horizontal row if there's a valid H
+        # We need to check if the constraints are satisfiable
+        if min_width > 0:
+            max_height_for_short_side = zone_sqm / min_width
+            min_height_needed = max(min_height_for_aspect, min_width)
+
+            # For zone to fit: min_height_needed <= max_height_for_short_side
+            if min_height_needed > max_height_for_short_side + 1e-6:
+                # Cannot fit in a horizontal row at all
+                logger.debug(f"Zone {zone_name} ({zone_sqm:.2f} sqm) CANNOT fit in horizontal row: "
+                           f"need H>={min_height_needed:.3f}, but max allowed is {max_height_for_short_side:.3f}")
+                return 0  # Signal: zone cannot fit, needs repartitioning
+            return min_height_needed
+        else:
+            # No min_width constraint, just use aspect ratio
+            return min_height_for_aspect
+
     def _apply_geometric_layout(self, zones: List[Zone]) -> Tuple[List[Zone], List[str]]:
         """
         Apply squarified treemap layout to zones.
@@ -738,11 +872,11 @@ class SpaceCalculator:
         ) for z in zones]
 
         # Retry loop: attempt layout, detect violations, repartition, retry
-        # CYCLE 31 FIX: Increased to 100 to allow more attempts for complex low_collab scenarios
+        # BLOCAGE 1 FIX: Increased to 150 to handle Circulation aspect ratio violations
         # Each iteration tries to fix violations by aggressively resizing violating zones
-        # Rationale: Complex low_collab layouts with 4-5 zone types in 400-500 sqm spaces need more repartitioning attempts
-        # At 50 attempts, some configurations reach max without converging; 100 allows convergence
-        max_repartition_attempts = 100
+        # Rationale: Circulation zones need multiple passes of reduction (35% each) to converge
+        # With 150 attempts, even large Circulation zones eventually shrink enough to fit
+        max_repartition_attempts = 150
         best_layout_zones = None
         best_violation_count = float('inf')
 
@@ -1206,20 +1340,38 @@ class SpaceCalculator:
             if attempt < max_repartition_attempts - 1:
                 logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
 
-                # CYCLE 30 FIX: For elastic zones (circulation) with aspect ratio violations,
-                # reduce their sqm so they fit better in available space, then redistribute lost area
+                # BLOCAGE 1 FIX: Detect unplaced zones (no geometry assigned)
+                # This indicates zones that couldn't fit in the treemap layout
+                unplaced_zones = [z for z in working_zones if z.x is None or z.y is None or z.width is None or z.length is None]
+                if unplaced_zones:
+                    logger.warning(f"BLOCAGE 1 FIX: {len(unplaced_zones)} zone(s) unplaced: {[z.name for z in unplaced_zones]}. Aggressively reducing circulation.")
+                    for zone in working_zones:
+                        if zone.zone_type == "circulation" and zone.sqm > 40.5:  # circulation min is 40 sqm (40.5 > 40.0)
+                            # Aggressive reduction: cut by 20% per attempt when zones are unplaced
+                            # This ensures Circulation shrinks fast enough to create room for other zones
+                            reduction = zone.sqm * 0.20
+                            old_sqm = zone.sqm
+                            zone.sqm = max(zone.sqm - reduction, 40.0)
+                            logger.warning(f"BLOCAGE 1 FIX: Unplaced zones detected. Reduced circulation {zone.name} by {reduction:.1f} sqm from {old_sqm:.1f} to {zone.sqm:.1f} sqm")
+
+                # BLOCAGE 1 FIX: For Circulation zones with aspect ratio violations,
+                # AGGRESSIVELY reduce their sqm to force them into smaller geometries that satisfy constraints
+                # This is the PRIMARY strategy for fixing Circulation aspect ratio violations
                 circulation_reduced_with_aspect_violation = False
                 total_reduction = 0.0
                 for zone in working_zones:
                     if zone.zone_type == "circulation" and zone.name in violation_map:
                         msg = violation_map[zone.name]
-                        if "aspect ratio" in msg and zone.sqm > 40.0:  # circulation min is 40 sqm
-                            # Reduce circulation by 5% to allow better placement in constrained space
-                            reduction = zone.sqm * 0.05
+                        if "aspect ratio" in msg and zone.sqm > 40.5:  # circulation min is 40 sqm (check > 40.5 to allow room)
+                            # BLOCAGE 1: Reduce circulation very aggressively - 35% per attempt for aspect ratio violations
+                            # This forces convergence quickly by shrinking the problematic zone
+                            reduction = zone.sqm * 0.35
+                            old_sqm = zone.sqm
                             zone.sqm = max(zone.sqm - reduction, 40.0)
                             total_reduction += reduction
                             circulation_reduced_with_aspect_violation = True
-                            logger.info(f"CYCLE 30 FIX: Reduced {zone.name} from {zone.sqm + reduction:.1f} to {zone.sqm:.1f} sqm (aspect ratio violation)")
+                            logger.info(f"BLOCAGE 1 FIX: Circulation {zone.name} aspect ratio violation (msg: {msg[:40]}...). "
+                                       f"Reduced from {old_sqm:.1f} to {zone.sqm:.1f} sqm (cut {reduction:.1f})")
 
                 # Repartition strategy: redistribute area from non-violating zones to violating zones
                 # to give violating zones more flexibility in the treemap
