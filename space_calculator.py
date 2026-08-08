@@ -283,14 +283,32 @@ class SpaceCalculator:
                 logger.debug(f"  Skipped {name} (ratio would worsen from {worst_ratio:.3f} to {test_ratio:.3f}), closing row with {len(row)} zones")
                 break
 
-        # Place the row
+        # CYCLE 26 J-1 FIX (CORRECT APPROACH): Pre-row-layout validation
+        # Before placing the row, verify that zone areas fit within available space
+        # If row_total_area / width > height, remove smallest zones until row fits
         if row:
             row_height = row_total_area / width if width > 0 else 0
-            # CYCLE 26 J-1 FIX: Clamp row height to available space to prevent overflow
-            # If row_height exceeds remaining container height, zones will overflow bounds
-            if row_height > height:
-                logger.info(f"CYCLE 26 J-1 FIX: Row height {row_height:.3f} exceeds available {height:.3f}m, clamping to fit container")
-                row_height = height
+
+            # Validate row fits in available height (with small tolerance for floating-point)
+            while row_height > height + 1e-3 and len(row) > 1:
+                logger.info(f"PRE-ROW-LAYOUT VALIDATION: row_height={row_height:.3f} exceeds available height={height:.3f}, removing smallest zone from {len(row)} zones")
+                # Remove the smallest zone (by area) from the row to make it fit
+                smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
+                removed_name, removed_area = row.pop(smallest_idx)
+                row_total_area -= removed_area
+                row_height = row_total_area / width if width > 0 else 0
+                logger.debug(f"Removed {removed_name} (area={removed_area:.3f}), row now has {len(row)} zones, new row_height={row_height:.3f}")
+
+            # If still not fitting (single zone too large), log warning but place anyway
+            # Constraint checking will catch the violation
+            if row_height > height + 1e-3 and len(row) == 1:
+                logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_height={row_height:.3f} but only {height:.3f} available - placing anyway for constraint detection")
+
+            if not row:
+                # All zones were removed - shouldn't happen but handle gracefully
+                logger.warning(f"_layout_row_horizontal: all zones removed during pre-row-layout validation!")
+                return 0.0
+
             current_x = x
             num_zones = len(row)
             logger.info(f"Row horizontal: placing {len(row)} zones (total_area={row_total_area:.2f}), row_height={row_height:.3f}")
@@ -351,14 +369,32 @@ class SpaceCalculator:
                 # Aspect ratio would worsen, so lay out current row and return
                 break
 
-        # Place the row
+        # CYCLE 26 J-1 FIX (CORRECT APPROACH): Pre-row-layout validation
+        # Before placing the row, verify that zone areas fit within available space
+        # If row_total_area / height > width, remove smallest zones until row fits
         if row:
             row_width = row_total_area / height if height > 0 else 0
-            # CYCLE 26 J-1 FIX: Clamp row width to available space to prevent overflow
-            # If row_width exceeds remaining container width, zones will overflow bounds
-            if row_width > width:
-                logger.info(f"CYCLE 26 J-1 FIX: Row width {row_width:.3f} exceeds available {width:.3f}m, clamping to fit container")
-                row_width = width
+
+            # Validate row fits in available width (with small tolerance for floating-point)
+            while row_width > width + 1e-3 and len(row) > 1:
+                logger.info(f"PRE-ROW-LAYOUT VALIDATION: row_width={row_width:.3f} exceeds available width={width:.3f}, removing smallest zone from {len(row)} zones")
+                # Remove the smallest zone (by area) from the row to make it fit
+                smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
+                removed_name, removed_area = row.pop(smallest_idx)
+                row_total_area -= removed_area
+                row_width = row_total_area / height if height > 0 else 0
+                logger.debug(f"Removed {removed_name} (area={removed_area:.3f}), row now has {len(row)} zones, new row_width={row_width:.3f}")
+
+            # If still not fitting (single zone too large), log warning but place anyway
+            # Constraint checking will catch the violation
+            if row_width > width + 1e-3 and len(row) == 1:
+                logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_width={row_width:.3f} but only {width:.3f} available - placing anyway for constraint detection")
+
+            if not row:
+                # All zones were removed - shouldn't happen but handle gracefully
+                logger.warning(f"_layout_row_vertical: all zones removed during pre-row-layout validation!")
+                return 0.0
+
             current_y = y
             num_zones = len(row)
 
