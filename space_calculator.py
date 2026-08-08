@@ -1041,6 +1041,18 @@ class SpaceCalculator:
                         zone.length = wz.length
                         # Keep the programmed sqm value (source of truth)
                         zone.sqm = wz.sqm  # Use working zone's sqm (which is programmed value)
+
+                # DEFECT D FIX (EARLY-RETURN): Apply boundary clipping before returning zero violations
+                boundary_max = 20.0
+                for zone in zones:
+                    if zone.y is not None and zone.length is not None and zone.y + zone.length > boundary_max + 1e-6:
+                        available_length = boundary_max - zone.y
+                        if available_length > 0 and zone.sqm is not None:
+                            new_width = zone.sqm / available_length
+                            logger.warning(f"DEFECT D FIX (EARLY-RETURN): {zone.name} overflow y+l={zone.y + zone.length:.3f}, clipping to length={available_length:.3f}, width={new_width:.3f}")
+                            zone.width = new_width
+                            zone.length = available_length
+
                 logger.info(f"Layout CONVERGED at attempt {attempt+1} with ZERO violations - returning early")
                 return zones, []
 
@@ -1148,6 +1160,25 @@ class SpaceCalculator:
                         if not is_valid:
                             best_violation_map[zone.name] = violation_msg
                 constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
+
+                # DEFECT D FIX (MAX-ATTEMPTS-RETURN): Apply boundary clipping before returning best layout
+                boundary_max = 20.0
+                for zone in zones:
+                    if zone.y is not None and zone.length is not None and zone.y + zone.length > boundary_max + 1e-6:
+                        available_length = boundary_max - zone.y
+                        if available_length > 0 and zone.sqm is not None:
+                            new_width = zone.sqm / available_length
+                            logger.warning(f"DEFECT D FIX (MAX-ATTEMPTS-RETURN): {zone.name} overflow y+l={zone.y + zone.length:.3f}, clipping to length={available_length:.3f}, width={new_width:.3f}")
+                            zone.width = new_width
+                            zone.length = available_length
+                    elif zone.x is not None and zone.width is not None and zone.x + zone.width > boundary_max + 1e-6:
+                        available_width = boundary_max - zone.x
+                        if available_width > 0 and zone.sqm is not None:
+                            new_length = zone.sqm / available_width
+                            logger.warning(f"DEFECT D FIX (MAX-ATTEMPTS-RETURN): {zone.name} overflow x+w={zone.x + zone.width:.3f}, clipping to width={available_width:.3f}, length={new_length:.3f}")
+                            zone.width = available_width
+                            zone.length = new_length
+
                 logger.critical(f"RETURNING from max_attempts block with {len(constraint_violations)} violations: {constraint_violations}")
                 return zones, constraint_violations
 
