@@ -248,9 +248,9 @@ class SpaceCalculator:
         Layout a horizontal row of rectangles.
         Returns the row height used.
         Implements squarification: greedily add rectangles to row while aspect ratio improves.
-        DEFECT I-3 FIX: Respect zone constraints when deciding row composition.
+        DEFECT I-2/I-3/I-4 FIX: Preserve exact area for every zone by proportionally scaling widths.
         GUARANTEES: Σ(zone_width) = width (within floating-point precision)
-                    Each zone.sqm = zone_width * zone_height (exact)
+                    Each zone.sqm = zone_width * zone_height (exact to 1e-6)
         """
         if not areas or width <= 0 or height <= 0:
             logger.warning(f"_layout_row_horizontal: early return due to empty/invalid: areas={len(areas) if areas else 0}, width={width}, height={height}")
@@ -287,19 +287,22 @@ class SpaceCalculator:
             num_zones = len(row)
             logger.info(f"Row horizontal: placing {len(row)} zones (total_area={row_total_area:.2f}), row_height={row_height:.3f}")
 
+            # DEFECT I-2/I-3/I-4 FIX: Compute all widths exactly to preserve area, NO special casing for last zone
+            # Key insight: row_height = total_area / width, so Σ(area_i / row_height) = Σarea_i / row_height = width exactly
+            # This preserves each zone's area WITHOUT requiring scaling or residual adjustments
+            accumulated_error = 0.0
+
             for idx, (name, area) in enumerate(row):
                 rect_width = area / row_height if row_height > 0 else 0
 
-                # Last zone in row absorbs any floating-point remainder
-                # This ensures Σ(rect_width) = width exactly
-                if idx == num_zones - 1:
-                    rect_width = (x + width) - current_x
-
                 rectangles[name] = (current_x, y, rect_width, row_height)
-                logger.debug(f"    {name}: x={current_x:.2f}, y={y:.2f}, w={rect_width:.2f}, h={row_height:.2f}, area={rect_width*row_height:.2f}")
+                actual_area = rect_width * row_height
+                error = abs(actual_area - area)
+                accumulated_error += error
+                logger.debug(f"    {name}: x={current_x:.2f}, y={y:.2f}, w={rect_width:.4f}, h={row_height:.4f}, computed_area={actual_area:.4f}, target_area={area:.4f}, error={error:.6f}")
                 current_x += rect_width
 
-            logger.debug(f"Row horizontal: placed {len(row)} zones, row_height={row_height:.3f}, sum_area={row_total_area:.3f}")
+            logger.info(f"Row horizontal: placed {len(row)} zones, row_height={row_height:.3f}, accumulated_error={accumulated_error:.6f}")
             return row_height
         logger.warning(f"_layout_row_horizontal: no zones in row!")
         return 0.0
@@ -312,9 +315,9 @@ class SpaceCalculator:
         Layout a vertical row (column) of rectangles.
         Returns the row width used.
         Implements squarification: greedily add rectangles while aspect ratio improves.
-        DEFECT I-3 FIX: Respect zone constraints when deciding row composition.
+        DEFECT I-2/I-3/I-4 FIX: Preserve exact area for every zone by proportionally scaling heights.
         GUARANTEES: Σ(zone_height) = height (within floating-point precision)
-                    Each zone.sqm = zone_width * zone_height (exact)
+                    Each zone.sqm = zone_width * zone_height (exact to 1e-6)
         """
         if not areas or width <= 0 or height <= 0:
             return 0.0
@@ -346,18 +349,22 @@ class SpaceCalculator:
             current_y = y
             num_zones = len(row)
 
+            # DEFECT I-2/I-3/I-4 FIX: Compute all heights exactly to preserve area, NO special casing for last zone
+            # Key insight: row_width = total_area / height, so Σ(area_i / row_width) = Σarea_i / row_width = height exactly
+            # This preserves each zone's area WITHOUT requiring scaling or residual adjustments
+            accumulated_error = 0.0
+
             for idx, (name, area) in enumerate(row):
                 rect_height = area / row_width if row_width > 0 else 0
 
-                # Last zone in row absorbs any floating-point remainder
-                # This ensures Σ(rect_height) = height exactly
-                if idx == num_zones - 1:
-                    rect_height = (y + height) - current_y
-
                 rectangles[name] = (x, current_y, row_width, rect_height)
+                actual_area = row_width * rect_height
+                error = abs(actual_area - area)
+                accumulated_error += error
+                logger.debug(f"    {name}: x={x:.2f}, y={current_y:.2f}, w={row_width:.4f}, h={rect_height:.4f}, computed_area={actual_area:.4f}, target_area={area:.4f}, error={error:.6f}")
                 current_y += rect_height
 
-            logger.debug(f"Row vertical: placed {len(row)} zones, row_width={row_width:.3f}, sum_area={row_total_area:.3f}")
+            logger.info(f"Row vertical: placed {len(row)} zones, row_width={row_width:.3f}, accumulated_error={accumulated_error:.6f}")
             return row_width
         return 0.0
 
@@ -537,30 +544,106 @@ class SpaceCalculator:
             # Apply treemap to ALL zones (including circulation)
             areas = [(z.name, z.sqm) for z in working_zones]
 
-            # DEFECT I-3 FIX: Prioritize constrained zones (those with high min_width)
-            # Sort primarily by min_width (zones with high constraints first), then by area (largest first)
-            def get_zone_priority(zone_name_area):
-                zone_name, area = zone_name_area
-                zone_type_str = zone_name_to_type.get(zone_name) if zone_name_to_type else None
-                if zone_type_str:
-                    try:
-                        zone_type_enum = ZoneType(zone_type_str)
-                        constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum)
-                        if constraints:
-                            min_width = constraints.get("min_width", 0)
-                            # High min_width gets priority (higher number = higher priority)
-                            # Break-room (1.8) and others with high min_width come first
-                            return (min_width, area)  # Sort by min_width desc, then area desc
-                    except ValueError:
-                        pass
-                return (0, area)  # Default: just sort by area
+            # DEFECT I-2/I-3/I-4 FIX: Pre-group constrained zones (especially phone booths)
+            # Phone booths cannot individually satisfy constraints (need w >= 1.0, but 2.5 sqm box can be 1.0x2.5)
+            # Solution: Group all phone booths into a single virtual zone for treemap, then subdivide them after
+            phone_booth_zones = []
+            other_zones = []
+            phone_booth_total = 0.0
 
-            areas.sort(key=lambda x: get_zone_priority(x), reverse=True)
+            for zone_name, area in areas:
+                zone_type_str = zone_name_to_type.get(zone_name) if zone_name_to_type else None
+                if zone_type_str == "phone-booth":
+                    phone_booth_zones.append((zone_name, area))
+                    phone_booth_total += area
+                else:
+                    other_zones.append((zone_name, area))
+
+            # If we have multiple phone booths, group them into a single mega-zone for treemap
+            # This ensures the phone booth band meets min_width constraint
+            # The mega-zone will be subdivided after treemap placement
+            if len(phone_booth_zones) > 1:
+                # Create a virtual "Phone Booths" mega-zone in treemap
+                areas = other_zones + [("__phone_booths_group__", phone_booth_total)]
+                logger.info(f"DEFECT I-3 FIX: Grouping {len(phone_booth_zones)} phone booths into mega-zone ({phone_booth_total:.2f} sqm) for treemap")
+            else:
+                # Single phone booth or no phone booths - use normal priority sort
+                def get_zone_priority(zone_name_area):
+                    zone_name, area = zone_name_area
+                    zone_type_str = zone_name_to_type.get(zone_name) if zone_name_to_type else None
+                    if zone_type_str:
+                        try:
+                            zone_type_enum = ZoneType(zone_type_str)
+                            constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum)
+                            if constraints:
+                                min_width = constraints.get("min_width", 0)
+                                return (min_width, area)
+                        except ValueError:
+                            pass
+                    return (0, area)
+
+                areas.sort(key=lambda x: get_zone_priority(x), reverse=True)
 
             rectangles: Dict[str, Tuple[float, float, float, float]] = {}
 
             # Start squarification from top-left with constraint awareness
             self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type)
+
+            # DEFECT I-3 FIX: Subdivide phone booth mega-zone if it exists
+            if "__phone_booths_group__" in rectangles:
+                group_x, group_y, group_w, group_h = rectangles["__phone_booths_group__"]
+                del rectangles["__phone_booths_group__"]  # Remove the virtual zone
+                logger.info(f"DEFECT I-3 FIX: Subdividing phone booths group at ({group_x:.2f}, {group_y:.2f}) size {group_w:.2f}x{group_h:.2f}")
+
+                # Place phone booths in a grid within the mega-zone
+                # Goal: arrange them to respect min_width and aspect ratio constraints
+                if phone_booth_zones:
+                    # Determine grid layout: arrange booths to fit width and height constraints
+                    # Each booth is ~1.1m wide x 2.3m deep (2.5 sqm)
+                    # Try to fit multiple booths per row
+
+                    # Simple strategy: arrange booths in rows
+                    # Each booth will be given width = group_w / ceil(sqrt(len(booths))) and height accordingly
+                    num_booths = len(phone_booth_zones)
+                    booths_per_row = max(1, int((group_w / 1.1)))  # Aim for 1.1m per booth
+                    num_rows = (num_booths + booths_per_row - 1) // booths_per_row  # Ceiling division
+                    booths_per_row = (num_booths + num_rows - 1) // num_rows  # Recalculate to balance
+
+                    booth_width = group_w / booths_per_row
+                    booth_height = group_h / num_rows
+
+                    current_booth_x = group_x
+                    current_booth_y = group_y
+                    booth_index = 0
+
+                    for row_idx in range(num_rows):
+                        for col_idx in range(booths_per_row):
+                            if booth_index >= len(phone_booth_zones):
+                                break
+
+                            zone_name, zone_area = phone_booth_zones[booth_index]
+                            # Place booth with width and height such that area ≈ zone_area
+                            # We want booth_width * booth_height ≈ zone_area
+                            # But we're constraining booth_width and booth_height by the grid
+                            # So we'll use the grid dimensions but verify area is preserved
+
+                            # Actually, to preserve area exactly: scale down the booth dimensions proportionally
+                            adjusted_height = zone_area / booth_width if booth_width > 0 else booth_height
+                            if adjusted_height > booth_height:
+                                # Booth needs more height than available - use grid height and adjust width
+                                adjusted_width = zone_area / booth_height if booth_height > 0 else booth_width
+                                adjusted_height = booth_height
+                            else:
+                                adjusted_width = booth_width
+
+                            rectangles[zone_name] = (current_booth_x, current_booth_y, adjusted_width, adjusted_height)
+                            logger.debug(f"  Phone booth {zone_name}: grid pos ({current_booth_x:.2f}, {current_booth_y:.2f}), size {adjusted_width:.2f}x{adjusted_height:.2f}, area={adjusted_width*adjusted_height:.2f}, target={zone_area:.2f}")
+
+                            current_booth_x += booth_width
+                            booth_index += 1
+
+                        current_booth_y += booth_height
+                        current_booth_x = group_x
 
             # Assign coordinates to zones from treemap
             constraint_violations = []
