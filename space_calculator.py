@@ -102,24 +102,24 @@ class SpaceCalculator:
     }
 
     # Shape constraints (geometry guardrails to prevent degenerate dimensions)
-    # min_width: minimum width in meters (to prevent thin slivers)
-    # max_aspect_ratio: max ratio of long_side/short_side (to prevent extreme rectangles)
-    # Rationale:
-    #   - Open space: needs 3.0m+ to accommodate multiple desk rows
-    #   - Meeting: 2.5m+ for usable meeting room width
-    #   - Phone booth: 1.0m+ x up to 2.5m tall (1.0-1.2m standard width, 2.2m depth typical)
-    #   - Quiet zone: 2.5m+ for focus area
-    #   - Break room: 1.8m+ (can function as hallway with seating/tables)
-    #   - Storage: 1.5m+ (compact archive/shelving)
-    #   - Circulation: 1.0m+ (hallway width, aspect flexible for corridors)
+    # min_width/min_height: minimum dimensions in meters (to prevent thin slivers)
+    # min_aspect_ratio/max_aspect_ratio: aspect ratio constraints to keep zones reasonably shaped
+    # Rationale (aligned with orchestrator constraints):
+    #   - Open space: needs 3.0m+ both dimensions, keep roughly square (0.5-3.0 aspect)
+    #   - Meeting: 2.5m+ both dimensions, more square (0.7-2.5 aspect)
+    #   - Phone booth: 1.0m+ width, allow tall (1.0-4.0 aspect)
+    #   - Quiet zone: 2.5m+ both dimensions, keep reasonably square (0.7-3.0 aspect)
+    #   - Break room: 1.8m+ both dimensions, more flexible (0.5-4.0 aspect)
+    #   - Storage: 1.5m+ both dimensions (flexible aspect)
+    #   - Circulation: 1.0m+ width (corridors can be thin, 1.0-5.0 aspect)
     SHAPE_CONSTRAINTS = {
-        ZoneType.OPEN_SPACE: {"min_width": 3.0, "max_aspect_ratio": 3.0},
-        ZoneType.MEETING: {"min_width": 2.5, "max_aspect_ratio": 2.5},
-        ZoneType.PHONE_BOOTH: {"min_width": 1.0, "max_aspect_ratio": 4.0},
-        ZoneType.QUIET_ZONE: {"min_width": 2.5, "max_aspect_ratio": 3.0},
-        ZoneType.BREAK_ROOM: {"min_width": 1.8, "max_aspect_ratio": 4.0},  # More flexible: can be hallway-style
-        ZoneType.STORAGE: {"min_width": 1.5, "max_aspect_ratio": 3.0},
-        ZoneType.CIRCULATION: {"min_width": 1.0, "max_aspect_ratio": 5.0},
+        ZoneType.OPEN_SPACE: {"min_width": 3.0, "min_height": 3.0, "min_aspect_ratio": 0.5, "max_aspect_ratio": 3.0},
+        ZoneType.MEETING: {"min_width": 2.5, "min_height": 2.5, "min_aspect_ratio": 0.7, "max_aspect_ratio": 2.5},
+        ZoneType.PHONE_BOOTH: {"min_width": 1.0, "min_height": 1.5, "min_aspect_ratio": 1.0, "max_aspect_ratio": 4.0},
+        ZoneType.QUIET_ZONE: {"min_width": 2.5, "min_height": 2.5, "min_aspect_ratio": 0.7, "max_aspect_ratio": 3.0},
+        ZoneType.BREAK_ROOM: {"min_width": 1.8, "min_height": 1.8, "min_aspect_ratio": 0.5, "max_aspect_ratio": 4.0},
+        ZoneType.STORAGE: {"min_width": 1.5, "min_height": 1.5, "min_aspect_ratio": 0.5, "max_aspect_ratio": 3.0},
+        ZoneType.CIRCULATION: {"min_width": 1.0, "min_height": 1.0, "min_aspect_ratio": 0.2, "max_aspect_ratio": 5.0},
     }
 
     # Collaboration percentages (target % of space for collaborative zones)
@@ -441,6 +441,86 @@ class SpaceCalculator:
 
         return True
 
+    def _fix_constraint_violation(self, zone: Zone) -> bool:
+        """
+        Attempt to fix constraint violations by adjusting zone dimensions.
+        Preserves area (width * length == sqm).
+
+        Returns True if violation was fixed, False if still violates or cannot be fixed.
+        """
+        if zone.width is None or zone.length is None or zone.sqm is None:
+            return False
+
+        try:
+            zone_type_enum = ZoneType(zone.zone_type)
+        except (ValueError, KeyError):
+            return False
+
+        constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum)
+        if not constraints:
+            return False
+
+        min_width = constraints.get("min_width", 0)
+        min_height = constraints.get("min_height", 0)
+        min_aspect = constraints.get("min_aspect_ratio", 0)
+        max_aspect = constraints.get("max_aspect_ratio", float('inf'))
+
+        # Check if there's a violation
+        is_valid, violation_msg = self._check_shape_constraints(zone)
+        if is_valid:
+            return True  # No violation, nothing to fix
+
+        area = zone.sqm
+
+        # Try strategy 1: Move towards ideal square
+        # Goal: reduce aspect ratio violations while keeping area = zone.sqm
+        ideal_side = math.sqrt(area)
+
+        # Check if ideal square satisfies all constraints
+        test_zone = Zone(
+            zone_type=zone.zone_type, name=zone.name, sqm=area, occupancy=0,
+            adjacencies=[], notes="", x=0, y=0, width=ideal_side, length=ideal_side
+        )
+        test_valid, _ = self._check_shape_constraints(test_zone)
+        if test_valid:
+            zone.width = ideal_side
+            zone.length = ideal_side
+            logger.debug(f"Fixed {zone.name} by making it square: {ideal_side:.2f}x{ideal_side:.2f}")
+            return True
+
+        # Try strategy 2: Find dimensions that satisfy min_width/min_height and aspect constraints
+        # Constraints: width >= min_width, height >= min_height, min_aspect <= width/height <= max_aspect, width*height == area
+
+        # Try a range of widths from min_width to sqrt(area * max_aspect)
+        max_possible_width = math.sqrt(area * max_aspect) if max_aspect < float('inf') else 2 * ideal_side
+        width_min = max(min_width, area / (ideal_side * 2))  # Don't make it too wide
+
+        for attempt in range(50):
+            # Binary search or linear search for valid width
+            test_width = width_min + (max_possible_width - width_min) * attempt / 50
+            if test_width < min_width:
+                test_width = min_width
+
+            test_length = area / test_width if test_width > 0 else ideal_side
+
+            if test_length < min_height:
+                continue
+
+            test_zone = Zone(
+                zone_type=zone.zone_type, name=zone.name, sqm=area, occupancy=0,
+                adjacencies=[], notes="", x=0, y=0, width=test_width, length=test_length
+            )
+            test_valid, _ = self._check_shape_constraints(test_zone)
+            if test_valid:
+                zone.width = test_width
+                zone.length = test_length
+                logger.debug(f"Fixed {zone.name} by adjusting dimensions: {test_width:.2f}x{test_length:.2f}")
+                return True
+
+        # Could not fix the violation
+        logger.warning(f"Could not fix constraint violation for {zone.name}: needs complex repartitioning. Issue: {violation_msg}")
+        return False
+
     def _check_shape_constraints(self, zone: Zone) -> Tuple[bool, str]:
         """
         Check if a zone's dimensions satisfy shape constraints.
@@ -474,18 +554,26 @@ class SpaceCalculator:
             return True, ""  # No constraint defined for this type
 
         min_width = constraints.get("min_width", 0)
+        min_height = constraints.get("min_height", 0)
+        min_aspect = constraints.get("min_aspect_ratio", 0)
         max_aspect = constraints.get("max_aspect_ratio", float('inf'))
 
         short_side = min(zone.width, zone.length)
         long_side = max(zone.width, zone.length)
 
         # Check minimum width
-        if short_side < min_width:
-            return False, f"Min width {min_width}m required, got {short_side:.3f}m"
+        if zone.width < min_width:
+            return False, f"Min width {min_width}m required, got {zone.width:.3f}m"
 
-        # Check aspect ratio
-        if long_side > 0 and short_side > 0:
-            aspect_ratio = long_side / short_side
+        # Check minimum height (length in our representation)
+        if zone.length < min_height:
+            return False, f"Min height {min_height}m required, got {zone.length:.3f}m"
+
+        # Check aspect ratio (computed as width/length)
+        if zone.width > 0 and zone.length > 0:
+            aspect_ratio = zone.width / zone.length
+            if aspect_ratio < min_aspect:
+                return False, f"Min aspect ratio {min_aspect:.1f} required, got {aspect_ratio:.2f}"
             if aspect_ratio > max_aspect:
                 return False, f"Max aspect ratio {max_aspect:.1f} required, got {aspect_ratio:.2f}"
 
@@ -701,8 +789,20 @@ class SpaceCalculator:
                     ratio = max(zone.width, zone.length)/min_dim if min_dim > 0 else 0
                     logger.debug(f"  {zone.name} ({zone.zone_type}): w={zone.width:.2f}, l={zone.length:.2f}, ratio={ratio:.3f} -> {'PASS' if is_valid else 'FAIL'}")
                     if not is_valid:
-                        violation_map[zone.name] = violation_msg
-                        logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
+                        # DEFECT I-2 FIX: Try to fix constraint violation while preserving area
+                        # If we can fix it, remove from violations; otherwise keep it
+                        fixed = self._fix_constraint_violation(zone)
+                        if fixed:
+                            # Re-check after fix
+                            is_valid, violation_msg = self._check_shape_constraints(zone)
+                            if is_valid:
+                                logger.info(f"Fixed constraint violation for {zone.name} while preserving area")
+                            else:
+                                violation_map[zone.name] = violation_msg
+                                logger.info(f"Still violates after fix: {zone.name} ({zone.zone_type}): {violation_msg}")
+                        else:
+                            violation_map[zone.name] = violation_msg
+                            logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
 
             # Convert violation_map to list for this iteration (deduplicated)
             constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in violation_map.items()]
