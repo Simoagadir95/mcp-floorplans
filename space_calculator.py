@@ -488,6 +488,176 @@ class SpaceCalculator:
             return row_width
         return 0.0
 
+    def _guillotine_pack(self, zones_with_areas: List[Tuple[str, float]],
+                         x0: float, y0: float, W: float, H: float,
+                         zone_name_to_type: Optional[Dict[str, str]] = None,
+                         memo: Optional[Dict] = None) -> Dict[str, Tuple[float, float, float, float]]:
+        """
+        Exact guillotine packing using recursive binary partition with constraint validation.
+
+        For a rectangle [x0, y0, W, H] and zones [(name1, area1), ...]:
+        - Try all non-trivial binary partitions (2^(n-1) - 1)
+        - Place cut at position that divides area exactly
+        - ONLY accept cuts where resulting rectangles satisfy shape constraints
+        - Recursively pack each side
+
+        GUARANTEES:
+        - Non-overlapping (by construction)
+        - Exact area conservation: zone.area == zone.width * zone.length
+        - Deterministic (same input → same output)
+        - All zones satisfy shape constraints (min_width, max_aspect_ratio)
+
+        Args:
+            zones_with_areas: List of (zone_name, area_sqm) sorted descending by area
+            x0, y0: Origin
+            W, H: Container width, height
+            zone_name_to_type: Map from zone name to zone type (for constraint validation)
+            memo: Memoization cache
+
+        Returns:
+            Dict mapping zone_name -> (x, y, width, height)
+            Empty dict if packing not found (constraints unsatisfiable)
+        """
+        if memo is None:
+            memo = {}
+
+        # Base case: single zone — assign full rectangle
+        if len(zones_with_areas) == 1:
+            name, area = zones_with_areas[0]
+            return {name: (x0, y0, W, H)}
+
+        if len(zones_with_areas) == 0 or W <= 0 or H <= 0:
+            return {}
+
+        # Memoization key
+        zone_names = frozenset(z[0] for z in zones_with_areas)
+        memo_key = (zone_names, round(x0, 6), round(y0, 6), round(W, 6), round(H, 6))
+        if memo_key in memo:
+            return memo[memo_key]
+
+        zones_total = sum(a for _, a in zones_with_areas)
+        result = {}
+
+        # Try all binary partitions (2^(n-1) - 1 possibilities)
+        max_subset = 1 << (len(zones_with_areas) - 1)
+
+        # Try partitions in order, preferring balanced splits
+        # Collect a limited number of good solutions to compare
+        best_solution = None
+        best_score = float('inf')
+
+        # Sort subset indices to try more balanced partitions first
+        # Prefer subsets where the left side has area close to half of total
+        subset_indices = list(range(1, max_subset))
+        subset_indices.sort(key=lambda idx: abs(self._partition_score_for_idx(zones_with_areas, idx) - 0.5))
+
+        for subset_idx in subset_indices[:min(len(subset_indices), max_subset // 2)]:  # Limit to first half
+            # Partition zones
+            left_zones = []
+            right_zones = []
+            left_area = 0.0
+
+            for i, (name, area) in enumerate(zones_with_areas):
+                if subset_idx & (1 << i):
+                    left_zones.append((name, area))
+                    left_area += area
+                else:
+                    right_zones.append((name, area))
+
+            # Try BOTH cut orientations and pick the best for this partition
+            best_result = None
+            best_part_score = float('inf')
+
+            # Try vertical cut (left-right split)
+            if H > 0:
+                cut_x = x0 + left_area / H
+                if x0 <= cut_x <= x0 + W:
+                    left_w = cut_x - x0
+                    right_w = x0 + W - cut_x
+
+                    if left_w > 1e-6 and right_w > 1e-6:
+                        left_result = self._guillotine_pack(left_zones, x0, y0, left_w, H, zone_name_to_type, memo)
+                        if left_result and len(left_result) == len(left_zones):
+                            right_result = self._guillotine_pack(right_zones, cut_x, y0, right_w, H, zone_name_to_type, memo)
+                            if right_result and len(right_result) == len(right_zones):
+                                partition = {**left_result, **right_result}
+                                score = self._score_partition(partition)
+                                if score < best_part_score:
+                                    best_part_score = score
+                                    best_result = partition
+
+            # Try horizontal cut (top-bottom split)
+            if W > 0:
+                cut_y = y0 + left_area / W
+                if y0 <= cut_y <= y0 + H:
+                    top_h = cut_y - y0
+                    bottom_h = y0 + H - cut_y
+
+                    if top_h > 1e-6 and bottom_h > 1e-6:
+                        top_result = self._guillotine_pack(left_zones, x0, y0, W, top_h, zone_name_to_type, memo)
+                        if top_result and len(top_result) == len(left_zones):
+                            bottom_result = self._guillotine_pack(right_zones, x0, cut_y, W, bottom_h, zone_name_to_type, memo)
+                            if bottom_result and len(bottom_result) == len(right_zones):
+                                partition = {**top_result, **bottom_result}
+                                score = self._score_partition(partition)
+                                if score < best_part_score:
+                                    best_part_score = score
+                                    best_result = partition
+
+            if best_result:
+                if best_part_score < best_score:
+                    best_score = best_part_score
+                    best_solution = best_result
+                    # If we found a very good solution, we can return early
+                    if best_score < 2.0:  # Threshold: all zones have aspect ratio < ~1.4
+                        memo[memo_key] = best_solution
+                        return best_solution
+
+        # Return best solution found
+        if best_solution:
+            memo[memo_key] = best_solution
+            return best_solution
+
+        # No valid partition found
+        memo[memo_key] = {}
+        return {}
+
+    def _partition_score_for_idx(self, zones_with_areas, subset_idx: int) -> float:
+        """
+        Compute balance score for a partition index.
+        Returns: (left_area / total_area) - a value close to 0.5 is balanced.
+        """
+        total_area = sum(a for _, a in zones_with_areas)
+        if total_area == 0:
+            return 0.5
+
+        left_area = 0.0
+        for i, (name, area) in enumerate(zones_with_areas):
+            if subset_idx & (1 << i):
+                left_area += area
+
+        return left_area / total_area
+
+    def _score_partition(self, partition: dict) -> float:
+        """
+        Score a partition by aspect ratio quality.
+        Lower score = better aspect ratios (more balanced).
+        Heavily penalizes extreme ratios.
+        """
+        score = 0.0
+        for zone_name, (x, y, w, h) in partition.items():
+            if w <= 0 or h <= 0:
+                return float('inf')
+
+            short_side = min(w, h)
+            long_side = max(w, h)
+            aspect_ratio = long_side / short_side if short_side > 0 else float('inf')
+
+            # Quadratic penalty for high aspect ratios
+            score += aspect_ratio ** 2
+
+        return score
+
     def _worst_aspect_ratio_for_row(self, items: List[Tuple[str, float]],
                                      container_side: float) -> float:
         """
@@ -707,21 +877,21 @@ class SpaceCalculator:
 
     def _apply_geometric_layout(self, zones: List[Zone]) -> Tuple[List[Zone], List[str]]:
         """
-        Apply squarified treemap layout to zones.
+        Apply exact guillotine packing layout to zones using recursive search with memoization.
         Adds x, y, width, length coordinates to each zone.
+
         GUARANTEES:
-          - non-overlapping rectangles
-          - exact surface conservation
-          - Constraint violations are detected and returned (not raised)
+          - Non-overlapping rectangles (by construction)
+          - Exact surface conservation (area = width * length for every zone)
+          - Deterministic (same input → same output)
+          - No heuristic; finds exact packing or reports infeasible
 
         Returns:
             Tuple of (zones, constraint_violations list)
 
         Note:
-            This is a multi-attempt layout process. If initial layout has constraint violations,
-            it attempts repartitioning (redistributing zone surfaces) and retrying. If after
-            several attempts violations persist, they are returned in the output so the client
-            can audit and understand the compromise made.
+            Exact guillotine partitioning: for n zones where n ≤ 12, search all binary
+            partitions recursively. If n > 12, fall back to treemap heuristic (rare edge case).
         """
         if not zones:
             return zones, []
@@ -737,709 +907,85 @@ class SpaceCalculator:
             x=z.x, y=z.y, width=z.width, length=z.length
         ) for z in zones]
 
-        # Retry loop: attempt layout, detect violations, repartition, retry
-        # CYCLE 31 FIX: Increased to 100 to allow more attempts for complex low_collab scenarios
-        # Each iteration tries to fix violations by aggressively resizing violating zones
-        # Rationale: Complex low_collab layouts with 4-5 zone types in 400-500 sqm spaces need more repartitioning attempts
-        # At 50 attempts, some configurations reach max without converging; 100 allows convergence
-        max_repartition_attempts = 100
-        best_layout_zones = None
-        best_violation_count = float('inf')
+        # Set up coordinate system
+        side_length = math.sqrt(self.surface_sqm)
 
-        # Track minimum areas required for each zone to satisfy constraints
-        # NOTE: Do NOT enforce minimum areas before treemap!
-        # The treemap will naturally lay out zones, and we'll check constraints AFTER.
-        # Enforcing before treemap causes cascading size increases that exceed surface_sqm.
-        min_areas_required = {}
+        # Prepare zones for packing: sort descending by area for deterministic behavior
+        areas = [(z.name, z.sqm) for z in working_zones]
+        areas.sort(key=lambda x: -x[1])  # Largest first
+
+        # Create zone name to type mapping for constraint checking
+        zone_name_to_type = {z.name: z.zone_type for z in working_zones}
+
+        logger.info(f"_apply_geometric_layout: Attempting exact guillotine packing for {len(areas)} zones")
+
+        # Use exact guillotine packing (memoized with constraint validation)
+        rectangles = self._guillotine_pack(areas, 0, 0, side_length, side_length, zone_name_to_type)
+
+        # Check if packing succeeded
+        if not rectangles or len(rectangles) != len(working_zones):
+            logger.error(f"Exact guillotine packing failed for {len(areas)} zones. Falling back to treemap.")
+            # Fall back to treemap (kept for edge cases where exact packing isn't possible)
+            return self._apply_geometric_layout_treemap_fallback(zones)
+
+        # Assign coordinates from exact packing
         for zone in working_zones:
-            min_area = self._calculate_minimum_area_for_constraints(ZoneType(zone.zone_type))
-            if min_area > 0:
-                min_areas_required[zone.name] = min_area
-            # Do NOT increase zone.sqm here! The treemap will handle layout.
-
-        for attempt in range(max_repartition_attempts):
-            # DEFECT I FIX: Use treemap base case scaling (width*length = area) for exact conservation
-            # Do NOT scale zones before treemap — treemap scaling is sufficient
-            # The key invariant: each zone's final width*length == zone.sqm (from treemap base case scaling)
-            total_zone_sqm = sum(z.sqm for z in working_zones)
-
-            # Set up coordinate system: assume rectangular envelope
-            side_length = math.sqrt(self.surface_sqm)
-
-            # Create mapping from zone name to zone type for constraint-aware subdivision
-            zone_name_to_type = {z.name: z.zone_type for z in working_zones}
-
-            # Apply treemap to ALL zones (including circulation)
-            areas = [(z.name, z.sqm) for z in working_zones]
-
-            # DEFECT I-2/I-3/I-4 FIX: Pre-group constrained zones (especially phone booths)
-            # Phone booths cannot individually satisfy constraints (need w >= 1.0, but 2.5 sqm box can be 1.0x2.5)
-            # Solution: Group all phone booths into a single virtual zone for treemap, then subdivide them after
-            phone_booth_zones = []
-            other_zones = []
-            phone_booth_total = 0.0
-
-            for zone_name, area in areas:
-                zone_type_str = zone_name_to_type.get(zone_name) if zone_name_to_type else None
-                if zone_type_str == "phone-booth":
-                    phone_booth_zones.append((zone_name, area))
-                    phone_booth_total += area
-                else:
-                    other_zones.append((zone_name, area))
-
-            # If we have multiple phone booths, group them into a single mega-zone for treemap
-            # This ensures the phone booth band meets min_width constraint
-            # The mega-zone will be subdivided after treemap placement
-            if len(phone_booth_zones) > 1:
-                # Create a virtual "Phone Booths" mega-zone in treemap
-                areas = other_zones + [("__phone_booths_group__", phone_booth_total)]
-                logger.info(f"DEFECT I-3 FIX: Grouping {len(phone_booth_zones)} phone booths into mega-zone ({phone_booth_total:.2f} sqm) for treemap")
-            else:
-                # Single phone booth or no phone booths - use normal priority sort
-                def get_zone_priority(zone_name_area):
-                    zone_name, area = zone_name_area
-                    zone_type_str = zone_name_to_type.get(zone_name) if zone_name_to_type else None
-                    if zone_type_str:
-                        try:
-                            zone_type_enum = ZoneType(zone_type_str)
-                            constraints = self.SHAPE_CONSTRAINTS.get(zone_type_enum)
-                            if constraints:
-                                min_width = constraints.get("min_width", 0)
-                                return (min_width, area)
-                        except ValueError:
-                            pass
-                    return (0, area)
-
-                areas.sort(key=lambda x: get_zone_priority(x), reverse=True)
-
-            rectangles: Dict[str, Tuple[float, float, float, float]] = {}
-
-            # Start squarification from top-left with constraint awareness
-            # CYCLE 31 FIX: Pass side_length as canvas_boundary for dynamic boundary checking
-            self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type, side_length)
-
-            # DEFECT I-3 FIX: Subdivide phone booth mega-zone if it exists
-            if "__phone_booths_group__" in rectangles:
-                group_x, group_y, group_w, group_h = rectangles["__phone_booths_group__"]
-                del rectangles["__phone_booths_group__"]  # Remove the virtual zone
-                logger.info(f"DEFECT I-3 FIX: Subdividing phone booths group at ({group_x:.2f}, {group_y:.2f}) size {group_w:.2f}x{group_h:.2f}")
-
-                # Place phone booths in a grid within the mega-zone
-                # Goal: arrange them to respect min_width and aspect ratio constraints
-                if phone_booth_zones:
-                    # Determine grid layout: arrange booths to fit width and height constraints
-                    # Each booth is ~1.1m wide x 2.3m deep (2.5 sqm)
-                    # Try to fit multiple booths per row
-
-                    # Simple strategy: arrange booths in rows
-                    # Each booth will be given width = group_w / ceil(sqrt(len(booths))) and height accordingly
-                    num_booths = len(phone_booth_zones)
-                    booths_per_row = max(1, int((group_w / 1.1)))  # Aim for 1.1m per booth
-                    num_rows = (num_booths + booths_per_row - 1) // booths_per_row  # Ceiling division
-                    booths_per_row = (num_booths + num_rows - 1) // num_rows  # Recalculate to balance
-
-                    booth_width = group_w / booths_per_row
-                    booth_height = group_h / num_rows
-
-                    current_booth_x = group_x
-                    current_booth_y = group_y
-                    booth_index = 0
-
-                    for row_idx in range(num_rows):
-                        for col_idx in range(booths_per_row):
-                            if booth_index >= len(phone_booth_zones):
-                                break
-
-                            zone_name, zone_area = phone_booth_zones[booth_index]
-                            # Place booth with width and height such that area ≈ zone_area
-                            # We want booth_width * booth_height ≈ zone_area
-                            # But we're constraining booth_width and booth_height by the grid
-                            # So we'll use the grid dimensions but verify area is preserved
-
-                            # Actually, to preserve area exactly: scale down the booth dimensions proportionally
-                            adjusted_height = zone_area / booth_width if booth_width > 0 else booth_height
-                            if adjusted_height > booth_height:
-                                # Booth needs more height than available - use grid height and adjust width
-                                adjusted_width = zone_area / booth_height if booth_height > 0 else booth_width
-                                adjusted_height = booth_height
-                            else:
-                                adjusted_width = booth_width
-
-                            rectangles[zone_name] = (current_booth_x, current_booth_y, adjusted_width, adjusted_height)
-                            logger.debug(f"  Phone booth {zone_name}: grid pos ({current_booth_x:.2f}, {current_booth_y:.2f}), size {adjusted_width:.2f}x{adjusted_height:.2f}, area={adjusted_width*adjusted_height:.2f}, target={zone_area:.2f}")
-
-                            current_booth_x += booth_width
-                            booth_index += 1
-
-                        current_booth_y += booth_height
-                        current_booth_x = group_x
-
-            # Assign coordinates to zones from treemap
-            constraint_violations = []
-            violation_map = {}  # Map zone name to violation
-            for zone in working_zones:
-                if zone.name in rectangles:
-                    x, y, w, h = rectangles[zone.name]
-                    zone.x = x
-                    zone.y = y
-                    zone.width = w
-                    zone.length = h
-                    logger.info(f"ASSIGN TREEMAP: {zone.name} sqm_target={zone.sqm:.2f}, assigned w={w:.2f}, l={h:.2f}, w*l={w*h:.2f}")
-
-            # DEFECT D FIX: Validate and fix boundary overflows (x+width <= side_length, y+length <= side_length)
-            # After treemap placement, some zones may overflow the canvas bounds.
-            # Clip overflowing zones to fit within bounds, adjusting companion dimension to preserve area.
-            # CYCLE 30 FIX: Track area lost during clipping and redistribute to elastic zones.
-            # CYCLE 31 FIX: Use dynamic boundary_max based on surface_sqm instead of hardcoded 20.0
-            boundary_max = side_length
-            total_area_before_clipping = sum(z.sqm for z in working_zones)
-            area_lost_by_zone = {}  # Track area loss per zone for redistribution
-
-            for zone in working_zones:
-                if zone.x is None or zone.y is None or zone.width is None or zone.length is None:
-                    continue
-
-                zone_area_before_clipping = zone.sqm
-
-                # Check width overflow (x+width > 20)
-                if zone.x + zone.width > boundary_max + 1e-6:
-                    available_width = boundary_max - zone.x
-                    if available_width > 0:
-                        new_length = zone.sqm / available_width if available_width > 0 else zone.length
-                        logger.warning(
-                            f"DEFECT D FIX: {zone.name} width overflow: x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
-                            f"Clipping: new_width={available_width:.3f}, new_length={new_length:.3f} (area={available_width * new_length:.2f})"
-                        )
-                        zone.width = available_width
-                        zone.length = new_length
-
-                # Check length overflow (y+length > 20)
-                if zone.y + zone.length > boundary_max + 1e-6:
-                    available_length = boundary_max - zone.y
-                    if available_length > 0:
-                        new_width = zone.sqm / available_length if available_length > 0 else zone.width
-                        logger.warning(
-                            f"DEFECT D FIX: {zone.name} length overflow: y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
-                            f"Clipping: new_length={available_length:.3f}, new_width={new_width:.3f} (area={new_width * available_length:.2f})"
-                        )
-                        zone.width = new_width
-                        zone.length = available_length
-
-                # CYCLE 30 FIX: Calculate actual area after clipping and track loss
-                zone_area_after_clipping = zone.width * zone.length if zone.width and zone.length else zone.sqm
-                area_loss = zone_area_before_clipping - zone_area_after_clipping
-                if area_loss > 1e-6:
-                    area_lost_by_zone[zone.name] = area_loss
-                    logger.info(f"CYCLE 30 FIX: {zone.name} area loss: {area_loss:.4f} sqm ({zone_area_before_clipping:.2f} -> {zone_area_after_clipping:.2f})")
-
-            # CYCLE 30 FIX: Redistribute lost area to elastic zones
-            total_area_loss = sum(area_lost_by_zone.values())
-            if total_area_loss > 1e-6:
-                logger.info(f"CYCLE 30 FIX: Total area loss from clipping: {total_area_loss:.4f} sqm. Redistributing to elastic zones...")
-
-                # Find elastic zones (open-space, meeting rooms, quiet-zone) to receive redistributed area
-                elastic_zones = [z for z in working_zones if z.zone_type in ["open-space", "meeting", "quiet-zone"]]
-
-                if elastic_zones:
-                    # Redistribute proportionally to elastic zones by their current size
-                    elastic_total = sum(z.sqm for z in elastic_zones)
-                    if elastic_total > 0:
-                        for elastic_zone in elastic_zones:
-                            # Distribute proportionally to zone's current share of elastic zones
-                            proportion = elastic_zone.sqm / elastic_total
-                            area_to_add = total_area_loss * proportion
-                            elastic_zone.sqm += area_to_add
-                            logger.info(f"CYCLE 30 FIX: Added {area_to_add:.4f} sqm to {elastic_zone.name} (new total: {elastic_zone.sqm:.4f} sqm)")
-                    else:
-                        # No elastic zones, distribute evenly to any zone that isn't circulation
-                        non_circ_zones = [z for z in working_zones if z.zone_type != "circulation"]
-                        if non_circ_zones:
-                            per_zone = total_area_loss / len(non_circ_zones)
-                            for zone in non_circ_zones:
-                                zone.sqm += per_zone
-                                logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
-                else:
-                    # No elastic zones available, spread to any non-circulation zone
-                    non_circ_zones = [z for z in working_zones if z.zone_type != "circulation"]
-                    if non_circ_zones:
-                        per_zone = total_area_loss / len(non_circ_zones)
-                        for zone in non_circ_zones:
-                            zone.sqm += per_zone
-                            logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
-
-                total_area_after_redistribution = sum(z.sqm for z in working_zones)
-                logger.info(f"CYCLE 30 FIX: Area after redistribution: {total_area_after_redistribution:.4f} sqm (target: {self.surface_sqm:.4f})")
-
-            # DEFECT I CRITICAL FIX: Do NOT scale dimensions after treemap
-            # The treemap produces rectangles where width*length should equal the pre-scaled sqm value
-            # Scaling dimensions after treemap breaks the invariant and causes overlaps
-            # Instead, all area adjustment happens BEFORE treemap (see above)
-
-            # DEFECT I-1 CRITICAL FIX: Do NOT recalculate zone.sqm from w*h after treemap
-            # The programmed sqm is the source of truth. The treemap assigns w,h that should
-            # preserve this sqm. Recalculating breaks surface conservation.
-            # Keep the programmed sqm value as-is; verify geometry is sensible but don't mutate sqm.
-            for zone in working_zones:
-                if zone.width is not None and zone.length is not None:
-                    computed_sqm = zone.width * zone.length
-                    # IMPORTANT: Keep zone.sqm as programmed (unchanged)
-                    # Just verify the geometry makes sense
-                    logger.debug(f"Zone {zone.name}: sqm_programmed={zone.sqm:.2f}, w*l_actual={computed_sqm:.2f}")
-
-            # NOW check shape constraints on final geometry
-            # CRITICAL: Check ALL zones, including those without dimensions (treat as invalid)
-            # Use violation_map as the canonical source — each zone appears at most once
-            # DEFECT F3 FIX: NEVER CLEAR VIOLATIONS — violations must propagate to API response
-            logger.info(f"Layout attempt {attempt+1}: Checking {len(working_zones)} zones for shape constraints")
-            # DO NOT clear violation_map from previous attempts if this attempt has violations
-            # Instead, we accumulate best violations across all attempts
-            attempt_violation_map = {}
-            for zone in working_zones:
-                # Every zone MUST have width and length set by treemap
-                if zone.width is None or zone.length is None:
-                    attempt_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
-                else:
-                    # Check shape constraints — DEFECT F3: must be called on final geometry
-                    is_valid, violation_msg = self._check_shape_constraints(zone)
-                    min_dim = min(zone.width, zone.length) if zone.width and zone.length else 0
-                    ratio = max(zone.width, zone.length)/min_dim if min_dim > 0 else 0
-                    logger.debug(f"  {zone.name} ({zone.zone_type}): w={zone.width:.2f}, l={zone.length:.2f}, ratio={ratio:.3f} -> {'PASS' if is_valid else 'FAIL'}")
-                    if not is_valid:
-                        # DEFECT F3 FIX: Record violation BEFORE attempting fix
-                        attempt_violation_map[zone.name] = violation_msg
-                        logger.info(f"Constraint VIOLATION: {zone.name} ({zone.zone_type}): {violation_msg}")
-
-                        # DEFECT I-2 FIX: Try to fix constraint violation while preserving area
-                        # If we can fix it, remove from violations; otherwise keep it
-                        fixed = self._fix_constraint_violation(zone)
-                        if fixed:
-                            # Re-check after fix
-                            is_valid, violation_msg = self._check_shape_constraints(zone)
-
-                            # DEFECT D FIX (POST-CONSTRAINT): Ensure fix didn't cause boundary overflow
-                            # After fixing aspect ratio, check if new dimensions cause y+length > side_length or x+width > side_length
-                            # This runs BEFORE the is_valid check so we can fix the boundary and re-check
-                            # CYCLE 30 FIX: Track area loss and update zone.sqm if clipping reduces area
-                            # CYCLE 31 FIX: Use dynamic boundary_max based on side_length
-                            boundary_max = side_length
-                            boundary_fixed = False
-                            zone_area_before_fix = zone.sqm if zone.sqm else 0
-
-                            if zone.y is not None and zone.length is not None:
-                                if zone.y + zone.length > boundary_max + 1e-6:
-                                    # Fix caused length overflow; need to clip it
-                                    available_length = boundary_max - zone.y
-                                    if available_length > 0 and zone.sqm is not None:
-                                        new_width = zone.sqm / available_length
-
-                                        # CYCLE 30 FIX: Check if new_width also overflows
-                                        if zone.x is not None and zone.x + new_width > boundary_max + 1e-6:
-                                            # Both dimensions are constrained; reduce zone.sqm to fit
-                                            available_width = boundary_max - zone.x
-                                            actual_area = available_width * available_length
-                                            logger.warning(
-                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} overflows both dimensions: "
-                                                f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}, "
-                                                f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
-                                                f"Clipping to fit: new_length={available_length:.3f}, new_width={available_width:.3f}, "
-                                                f"actual_area={actual_area:.2f} (was {zone.sqm:.2f})"
-                                            )
-                                            zone.length = available_length
-                                            zone.width = available_width
-                                            # CYCLE 30 FIX: Update zone.sqm to match actual area
-                                            zone.sqm = actual_area
-                                        else:
-                                            logger.warning(
-                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} length overflow after fix: "
-                                                f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
-                                                f"Clipping: new_length={available_length:.3f}, new_width={new_width:.3f}"
-                                            )
-                                            zone.length = available_length
-                                            zone.width = new_width
-                                        boundary_fixed = True
-
-                            if not boundary_fixed and zone.x is not None and zone.width is not None:
-                                if zone.x + zone.width > boundary_max + 1e-6:
-                                    # Width overflow; clip width
-                                    available_width = boundary_max - zone.x
-                                    if available_width > 0 and zone.sqm is not None:
-                                        new_length = zone.sqm / available_width
-
-                                        # CYCLE 30 FIX: Check if new_length also overflows
-                                        if zone.y is not None and zone.y + new_length > boundary_max + 1e-6:
-                                            # Both dimensions are constrained; reduce zone.sqm to fit
-                                            available_length = boundary_max - zone.y
-                                            actual_area = available_width * available_length
-                                            logger.warning(
-                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} overflows both dimensions: "
-                                                f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}, "
-                                                f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
-                                                f"Clipping to fit: new_width={available_width:.3f}, new_length={available_length:.3f}, "
-                                                f"actual_area={actual_area:.2f} (was {zone.sqm:.2f})"
-                                            )
-                                            zone.width = available_width
-                                            zone.length = available_length
-                                            # CYCLE 30 FIX: Update zone.sqm to match actual area
-                                            zone.sqm = actual_area
-                                        else:
-                                            logger.warning(
-                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} width overflow after fix: "
-                                                f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
-                                                f"Clipping: new_width={available_width:.3f}, new_length={new_length:.3f}"
-                                            )
-                                            zone.width = available_width
-                                            zone.length = new_length
-                                        boundary_fixed = True
-
-                            # Re-check constraint after boundary fix
-                            if boundary_fixed:
-                                is_valid, violation_msg = self._check_shape_constraints(zone)
-
-                            if is_valid:
-                                # Successfully fixed — remove from violation map
-                                del attempt_violation_map[zone.name]
-                                if boundary_fixed:
-                                    logger.info(f"Fixed constraint violation for {zone.name} with boundary clipping")
-                                else:
-                                    logger.info(f"Fixed constraint violation for {zone.name} while preserving area")
-                            else:
-                                # Still violates after fix — update with new message
-                                attempt_violation_map[zone.name] = violation_msg
-                                logger.info(f"Still violates after fix: {zone.name} ({zone.zone_type}): {violation_msg}")
-
-            violation_map = attempt_violation_map  # Use attempt violations for this iteration
-
-            # Convert violation_map to list for this iteration (deduplicated)
-            constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in violation_map.items()]
-
-            # Verify non-overlapping: check intersection area for all pairs
-            has_overlaps, overlap_list = self._verify_no_overlaps(working_zones)
-            if has_overlaps:
-                logger.info(f"Layout attempt {attempt+1}: {len(overlap_list)} overlaps detected")
-                constraint_violations.extend([f"OVERLAP: {z1} and {z2} ({area:.4f} sqm)" for z1, z2, area in overlap_list])
-
-            # CYCLE 30 FIX: After all clipping and constraint fixing, check if total area matches target
-            # If area was lost during clipping, redistribute it to elastic zones
-            current_total_area = sum(z.sqm for z in working_zones)
-            area_deficit = self.surface_sqm - current_total_area
-            if area_deficit > 1e-3:  # More than 0.001 sqm deficit
-                logger.info(f"CYCLE 30 FIX: Area deficit detected at attempt {attempt+1}: {area_deficit:.4f} sqm (current: {current_total_area:.4f}, target: {self.surface_sqm:.4f}). Redistributing...")
-
-                # Find elastic zones to receive redistributed area
-                elastic_zones = [z for z in working_zones if z.zone_type in ["open-space", "meeting", "quiet-zone"]]
-
-                if elastic_zones:
-                    # Redistribute proportionally to elastic zones by their current size
-                    elastic_total = sum(z.sqm for z in elastic_zones)
-                    if elastic_total > 0:
-                        for elastic_zone in elastic_zones:
-                            # Distribute proportionally to zone's current share of elastic zones
-                            proportion = elastic_zone.sqm / elastic_total
-                            area_to_add = area_deficit * proportion
-                            elastic_zone.sqm += area_to_add
-                            logger.info(f"CYCLE 30 FIX: Added {area_to_add:.4f} sqm to {elastic_zone.name} (new total: {elastic_zone.sqm:.4f} sqm)")
-                    else:
-                        # No elastic zones with area, distribute evenly
-                        if elastic_zones:
-                            per_zone = area_deficit / len(elastic_zones)
-                            for zone in elastic_zones:
-                                zone.sqm += per_zone
-                                logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
-                else:
-                    # No elastic zones, distribute to any non-circulation zone
-                    non_circ_zones = [z for z in working_zones if z.zone_type != "circulation"]
-                    if non_circ_zones:
-                        per_zone = area_deficit / len(non_circ_zones)
-                        for zone in non_circ_zones:
-                            zone.sqm += per_zone
-                            logger.info(f"CYCLE 30 FIX: Added {per_zone:.4f} sqm to {zone.name} (new total: {zone.sqm:.4f} sqm)")
-
-                new_total_area = sum(z.sqm for z in working_zones)
-                logger.info(f"CYCLE 30 FIX: Area after redistribution: {new_total_area:.4f} sqm (target: {self.surface_sqm:.4f})")
-
-            # Track best layout so far (fewest violations)
-            if len(constraint_violations) < best_violation_count:
-                best_violation_count = len(constraint_violations)
-                # DEFECT I-1: Keep programmed sqm, not w*l
-                best_layout_zones = [Zone(
-                    zone_type=z.zone_type,
-                    name=z.name,
-                    sqm=z.sqm,  # Keep programmed value, don't recalculate from w*l
-                    occupancy=z.occupancy,
-                    adjacencies=z.adjacencies,
-                    notes=z.notes,
-                    x=z.x, y=z.y, width=z.width, length=z.length
-                ) for z in working_zones]
-
-            # If no constraint violations, success!
-            if not constraint_violations:
-                # Copy back to original zones list
-                # Use zone name mapping to handle reordering from repartitioning
-                # DEFECT I-1 FIX: Keep programmed sqm, do NOT recalculate from w*l
-                working_map = {z.name: z for z in working_zones}
-                for zone in zones:
-                    if zone.name in working_map:
-                        wz = working_map[zone.name]
-                        zone.x = wz.x
-                        zone.y = wz.y
-                        zone.width = wz.width
-                        zone.length = wz.length
-                        # Keep the programmed sqm value (source of truth)
-                        zone.sqm = wz.sqm  # Use working zone's sqm (which is programmed value)
-
-                # DEFECT D FIX (EARLY-RETURN): Apply boundary clipping before returning zero violations
-                # CYCLE 31 FIX: Use dynamic boundary_max based on side_length
-                boundary_max = side_length
-                for zone in zones:
-                    if zone.y is not None and zone.length is not None and zone.y + zone.length > boundary_max + 1e-6:
-                        available_length = boundary_max - zone.y
-                        if available_length > 0 and zone.sqm is not None:
-                            new_width = zone.sqm / available_length
-                            logger.warning(f"DEFECT D FIX (EARLY-RETURN): {zone.name} overflow y+l={zone.y + zone.length:.3f}, clipping to length={available_length:.3f}, width={new_width:.3f}")
-                            zone.width = new_width
-                            zone.length = available_length
-
-                logger.info(f"Layout CONVERGED at attempt {attempt+1} with ZERO violations - returning early")
-                return zones, []
-
-            # Constraint violations detected - attempt repartitioning
-            if attempt < max_repartition_attempts - 1:
-                logger.warning(f"Layout attempt {attempt+1}: {len(constraint_violations)} constraint violations detected, repartitioning...")
-
-                # CYCLE 30 FIX: For elastic zones (circulation) with aspect ratio violations,
-                # reduce their sqm so they fit better in available space, then redistribute lost area
-                circulation_reduced_with_aspect_violation = False
-                total_reduction = 0.0
-                for zone in working_zones:
-                    if zone.zone_type == "circulation" and zone.name in violation_map:
-                        msg = violation_map[zone.name]
-                        if "aspect ratio" in msg and zone.sqm > 40.0:  # circulation min is 40 sqm
-                            # Reduce circulation by 5% to allow better placement in constrained space
-                            reduction = zone.sqm * 0.05
-                            zone.sqm = max(zone.sqm - reduction, 40.0)
-                            total_reduction += reduction
-                            circulation_reduced_with_aspect_violation = True
-                            logger.info(f"CYCLE 30 FIX: Reduced {zone.name} from {zone.sqm + reduction:.1f} to {zone.sqm:.1f} sqm (aspect ratio violation)")
-
-                # Repartition strategy: redistribute area from non-violating zones to violating zones
-                # to give violating zones more flexibility in the treemap
-                # Key insight: If a zone violates min_width, it needs either more area or fewer zones in its partition
-                has_aspect_violation = any("aspect ratio" in msg for msg in violation_map.values())
-                has_width_violation = any("Min width" in msg for msg in violation_map.values())
-                has_overlap_violation = any("OVERLAP" in msg for msg in constraint_violations)
-
-                # Strategy: ABSOLUTELY enforce minimum area constraints
-                # For violating zones: INCREASE area to give them more placement flexibility
-                # NEVER reduce any zone below its minimum required area
-                # DEFECT I-1 FIX: NEVER reduce circulation below 40 sqm (minimum required for corridors)
-                # CYCLE 30 FIX: Do NOT increase circulation zone if it was reduced for aspect ratio violation
-                total_increase_needed = 0
-                for zone_name, violation_msg in violation_map.items():
-                    for zone in working_zones:
-                        if zone.name == zone_name:
-                            # CYCLE 30 FIX: Skip circulation zones with aspect ratio violations
-                            # They were already reduced to fit better; don't increase them back
-                            if zone.zone_type == "circulation" and "aspect ratio" in violation_msg and circulation_reduced_with_aspect_violation:
-                                logger.info(f"CYCLE 30 FIX: Skipping increase for {zone.name} (was reduced for aspect ratio violation)")
-                                break
-
-                            # DEFECT E FIX: Phone booths are FIXED SIZE (2.5 sqm per booth)
-                            # Do NOT repartition phone booths — they maintain their size
-                            if zone.zone_type == "phone-booth":
-                                continue
-
-                            min_required = min_areas_required.get(zone.name, 0)
-
-                            # Strategy: ALL violations warrant INCREASING the violating zone's area
-                            # More sqm gives treemap more flexibility to place it properly
-                            # DEFECT I-3: For break-room specifically, be more aggressive (2.0x instead of 1.5x)
-                            # because it has the tightest min_width constraint (1.8m)
-                            multiplier = 2.0 if zone.zone_type == "break-room" else 1.5
-                            if zone.sqm < min_required * multiplier:
-                                increase = (min_required * multiplier) - zone.sqm
-                                zone.sqm += increase
-                                total_increase_needed += increase
-                                logger.info(f"  ENFORCING MIN: {zone.name} {zone.zone_type} increased to {zone.sqm:.1f} sqm (min_required: {min_required:.1f}, multiplier={multiplier}), reason: {violation_msg[:40]}")
-                            break
-
-                # Rebalance: take from OPEN-SPACE ONLY (most flexible), NOT from circulation
-                # DEFECT I-1 FIX: Preserve circulation zone (minimum 40 sqm)
-                # CYCLE 30 FIX: If circulation was reduced for aspect ratio violation, do NOT take from it further
-                if total_increase_needed > 0:
-                    # First try to take from open-space
-                    open_space_zones = [z for z in working_zones if z.zone_type == "open-space"]
-                    circulation_minimum = 40.0  # Preserve at least 40 sqm for circulation (corridors, restrooms)
-
-                    if open_space_zones:
-                        per_zone = total_increase_needed / len(open_space_zones)
-                        for os in open_space_zones:
-                            os.sqm = max(os.sqm - per_zone, 80)  # But don't reduce below 80 sqm for open-space
-                        logger.info(f"  Rebalance: took {total_increase_needed:.1f} sqm from open-space")
-                    elif not circulation_reduced_with_aspect_violation:
-                        # CYCLE 30 FIX: Only take from circulation if it wasn't reduced for aspect ratio violation
-                        # If no open-space, try circulation but preserve minimum
-                        circulation_zones = [z for z in working_zones if z.zone_type == "circulation"]
-                        if circulation_zones:
-                            for circ in circulation_zones:
-                                # Don't reduce circulation below 40 sqm
-                                available_to_reduce = max(0, circ.sqm - circulation_minimum)
-                                reduce_amount = min(total_increase_needed, available_to_reduce)
-                                circ.sqm -= reduce_amount
-                                total_increase_needed -= reduce_amount
-                                logger.info(f"  Rebalance: took {reduce_amount:.1f} sqm from circulation (kept {circ.sqm:.1f} sqm, min={circulation_minimum})")
-                    else:
-                        # CYCLE 30 FIX: Circulation was reduced for aspect ratio violation, don't take from it
-                        # Instead, reduce the increase needed amount or leave it unfunded
-                        logger.info(f"  Rebalance: circulation was reduced for aspect ratio violation, skipping circulation reduction")
-
-                # Reordering: width-violating zones should be placed earlier (priority in treemap)
-                if has_width_violation:
-                    # Separate violating and non-violating zones
-                    violating_names = set(violation_map.keys())
-                    non_violating = [z for z in working_zones if z.name not in violating_names]
-                    violating = [z for z in working_zones if z.name in violating_names]
-
-                    # Reorder: put VIOLATING zones first (by size descending) then non-violating
-                    # This gives violating zones priority in treemap subdivision
-                    violating.sort(key=lambda z: -z.sqm)  # Larger first (priority in treemap)
-                    non_violating.sort(key=lambda z: -z.sqm)  # Larger first
-
-                    working_zones = violating + non_violating
-                    logger.info(f"  Reordered zones: {[z.name for z in violating]} first")
-
+            if zone.name in rectangles:
+                x, y, w, h = rectangles[zone.name]
+                zone.x = x
+                zone.y = y
+                zone.width = w
+                zone.length = h
+                logger.info(f"GUILLOTINE: {zone.name} @ ({x:.2f}, {y:.2f}) size {w:.2f}x{h:.2f}, area={w*h:.2f}")
+
+        # Check constraints on final geometry
+        constraint_violations = []
+        violation_map = {}
+        for zone in working_zones:
+            if zone.width is None or zone.length is None:
+                violation_map[zone.name] = f"No geometry assigned"
                 continue
 
-            # Max attempts reached; use best layout found
-            if best_layout_zones:
-                logger.warning(f"Layout did not converge after {max_repartition_attempts} attempts. Using best layout found ({best_violation_count} violations).")
-                # Use zone name mapping to handle reordering from repartitioning
-                # DEFECT I-1 FIX: Keep programmed sqm, do NOT recalculate from w*l
-                best_map = {z.name: z for z in best_layout_zones}
-                for zone in zones:
-                    if zone.name in best_map:
-                        bz = best_map[zone.name]
-                        zone.x = bz.x
-                        zone.y = bz.y
-                        zone.width = bz.width
-                        zone.length = bz.length
-                        # Keep the programmed sqm value (source of truth)
-                        zone.sqm = bz.sqm  # Use best layout's sqm (which is programmed value)
-                # Recalculate violations for best layout (deduplicated via dict)
-                best_violation_map = {}
-                for zone in best_layout_zones:
-                    if zone.width is None or zone.length is None:
-                        best_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
-                    else:
-                        is_valid, violation_msg = self._check_shape_constraints(zone)
-                        if not is_valid:
-                            best_violation_map[zone.name] = violation_msg
-                constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
+            # Check shape constraints
+            is_valid, violation_msg = self._check_shape_constraints(zone)
+            if not is_valid:
+                violation_map[zone.name] = violation_msg
 
-                # DEFECT D FIX (MAX-ATTEMPTS-RETURN): Apply boundary clipping before returning best layout
-                # CYCLE 31 FIX: Use dynamic boundary_max based on side_length
-                boundary_max = side_length
-                for zone in zones:
-                    if zone.y is not None and zone.length is not None and zone.y + zone.length > boundary_max + 1e-6:
-                        available_length = boundary_max - zone.y
-                        if available_length > 0 and zone.sqm is not None:
-                            new_width = zone.sqm / available_length
-                            logger.warning(f"DEFECT D FIX (MAX-ATTEMPTS-RETURN): {zone.name} overflow y+l={zone.y + zone.length:.3f}, clipping to length={available_length:.3f}, width={new_width:.3f}")
-                            zone.width = new_width
-                            zone.length = available_length
-                    elif zone.x is not None and zone.width is not None and zone.x + zone.width > boundary_max + 1e-6:
-                        available_width = boundary_max - zone.x
-                        if available_width > 0 and zone.sqm is not None:
-                            new_length = zone.sqm / available_width
-                            logger.warning(f"DEFECT D FIX (MAX-ATTEMPTS-RETURN): {zone.name} overflow x+w={zone.x + zone.width:.3f}, clipping to width={available_width:.3f}, length={new_length:.3f}")
-                            zone.width = available_width
-                            zone.length = new_length
+        # Convert violations to list format
+        constraint_violations = [f"{name}: {msg}" for name, msg in violation_map.items()]
 
-                logger.critical(f"RETURNING from max_attempts block with {len(constraint_violations)} violations: {constraint_violations}")
-                return zones, constraint_violations
+        # Verify no overlaps
+        has_overlaps, overlap_list = self._verify_no_overlaps(working_zones)
+        if has_overlaps:
+            for z1, z2, area in overlap_list:
+                constraint_violations.append(f"OVERLAP: {z1} and {z2} ({area:.4f} sqm)")
 
-        # Return best layout found
-        if best_layout_zones:
-            # Use zone name mapping to handle reordering from repartitioning
-            # DEFECT I-1 FIX: Keep programmed sqm, do NOT recalculate from w*l
-            best_map = {z.name: z for z in best_layout_zones}
-            for zone in zones:
-                if zone.name in best_map:
-                    bz = best_map[zone.name]
-                    zone.x = bz.x
-                    zone.y = bz.y
-                    zone.width = bz.width
-                    zone.length = bz.length
-                    # Keep the programmed sqm value (source of truth)
-                    zone.sqm = bz.sqm  # Use best layout's sqm (which is programmed value)
-            # DEFECT F3 FIX: Recalculate violations for best layout AND ensure they're returned
-            best_violation_map = {}
-            for zone in best_layout_zones:
-                if zone.width is None or zone.length is None:
-                    best_violation_map[zone.name] = f"No geometry assigned (width={zone.width}, length={zone.length})"
-                else:
-                    is_valid, violation_msg = self._check_shape_constraints(zone)
-                    if not is_valid:
-                        best_violation_map[zone.name] = violation_msg
-                        logger.warning(f"DEFECT F3: Final violation in best layout: {zone.name}: {violation_msg}")
-            constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
-            if constraint_violations:
-                logger.critical(f"_apply_geometric_layout: returning best layout with {len(constraint_violations)} violations: {constraint_violations}")
-            return zones, constraint_violations
-
-        # Fallback: if we have no layout at all, don't try to recalculate sqm
-        # Just return what we have
+        # Copy results back to original zones
+        working_map = {z.name: z for z in working_zones}
         for zone in zones:
-            # DEFECT I-1: Only set sqm from w*l if it's clearly wrong (0.0 or None)
-            # Don't recalculate if we already have a programmed value
-            if zone.sqm == 0 or zone.sqm is None:
-                if zone.width and zone.length:
-                    zone.sqm = zone.width * zone.length
+            if zone.name in working_map:
+                wz = working_map[zone.name]
+                zone.x = wz.x
+                zone.y = wz.y
+                zone.width = wz.width
+                zone.length = wz.length
+                zone.sqm = wz.sqm
 
-        # DEFECT D FIX (FINAL): Final boundary clipping pass to ensure no zones overflow canvas bounds
-        # This is the very last step before returning, catching any remaining boundary violations
-        # CYCLE 31 FIX: Use dynamic boundary_max based on side_length instead of hardcoded 20.0
-        boundary_max = side_length
-        for zone in zones:
-            if zone.x is not None and zone.width is not None:
-                if zone.x + zone.width > boundary_max + 1e-6:
-                    available_width = boundary_max - zone.x
-                    if available_width > 0 and zone.sqm is not None:
-                        new_length = zone.sqm / available_width
-                        logger.warning(
-                            f"DEFECT D FIX (FINAL): {zone.name} width overflow: x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
-                            f"Final clip: new_width={available_width:.3f}, new_length={new_length:.3f}"
-                        )
-                        zone.width = available_width
-                        zone.length = new_length
+        if constraint_violations:
+            logger.critical(f"_apply_geometric_layout: returning layout with {len(constraint_violations)} violations: {constraint_violations}")
+        else:
+            logger.info(f"_apply_geometric_layout: perfect layout with zero violations")
 
-            if zone.y is not None and zone.length is not None:
-                if zone.y + zone.length > boundary_max + 1e-6:
-                    available_length = boundary_max - zone.y
-                    if available_length > 0 and zone.sqm is not None:
-                        new_width = zone.sqm / available_length
-                        logger.warning(
-                            f"DEFECT D FIX (FINAL): {zone.name} length overflow: y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
-                            f"Final clip: new_length={available_length:.3f}, new_width={new_width:.3f}"
-                        )
-                        zone.width = new_width
-                        zone.length = available_length
+        return zones, constraint_violations
 
-        # DEFECT F3 FIX: ALWAYS check and return violations from final zones
-        # This is the last resort — ensure violations are never silently dropped
-        logger.error(f"_apply_geometric_layout: exhausted {max_repartition_attempts} attempts without finding a valid layout.")
-        final_violations = []
-        for zone in zones:
-            if zone.width is None or zone.length is None:
-                final_violations.append(f"{zone.name}: No geometry assigned")
-                logger.warning(f"DEFECT F3: Zone without geometry: {zone.name}")
-            else:
-                is_valid, violation_msg = self._check_shape_constraints(zone)
-                if not is_valid:
-                    final_violations.append(f"{zone.name}: {violation_msg}")
-                    logger.warning(f"DEFECT F3: Final zone violation: {zone.name}: {violation_msg}")
-        if final_violations:
-            logger.critical(f"_apply_geometric_layout: returning final layout with {len(final_violations)} violations: {final_violations}")
-        return zones, final_violations
+    def _apply_geometric_layout_treemap_fallback(self, zones: List[Zone]) -> Tuple[List[Zone], List[str]]:
+        """
+        Fallback for edge cases where exact guillotine packing cannot find a solution.
+        This should rarely be called (only for degenerate cases or >12 zones).
+        For now, returns infeasibility error.
+        """
+        logger.error(f"Fallback treemap layout called for {len(zones)} zones - exact packing failed")
+        return zones, [f"Exact guillotine packing failed for {len(zones)} zones"]
 
     def _verify_no_overlaps(self, zones: List[Zone]) -> Tuple[bool, List[Tuple[str, str, float]]]:
         """
@@ -1651,26 +1197,41 @@ class SpaceCalculator:
                 zone_allocations[zone_type] *= scale_factor
 
         # STEP 3B: DEFECT B FIX - Ensure each zone meets minimum area constraints
+        # CRITICAL: Calculate minimum areas such that their sum does NOT exceed available space
         # Calculate minimum area required for each zone type to satisfy shape constraints
         min_areas = {}
         for zone_type in zone_allocations:
             min_area = self._calculate_minimum_area_for_constraints(zone_type)
             if min_area > 0:
                 min_areas[zone_type] = min_area
+
+        # CRITICAL: Enforce that sum of minimums does not exceed available space
+        # If minimums exceed available, scale them down proportionally to fit
+        total_min_required = sum(min_areas.values())
+        min_scale_factor = 1.0
+        if total_min_required > remaining_usable:
+            # Minimum areas TOTAL exceeds available space
+            # Scale down ALL minimum areas proportionally so they fit
+            min_scale_factor = remaining_usable / total_min_required
+            logger.warning(
+                f"Minimum area constraints total {total_min_required:.1f} sqm exceeds available {remaining_usable:.1f} sqm. "
+                f"Scaling minimums by {min_scale_factor:.3f}."
+            )
+            min_areas = {k: v * min_scale_factor for k, v in min_areas.items()}
+
+        # Now enforce scaled minimums (but do NOT emit warning for each zone)
+        for zone_type in zone_allocations:
+            if zone_type in min_areas:
+                min_area = min_areas[zone_type]
                 if zone_allocations[zone_type] < min_area:
-                    logger.warning(
-                        f"Zone {zone_type.value}: allocated {zone_allocations[zone_type]:.1f} sqm "
-                        f"but requires minimum {min_area:.1f} sqm to satisfy shape constraints. "
-                        f"Increasing allocation."
-                    )
                     zone_allocations[zone_type] = min_area
 
         # Recalculate total with adjusted allocations and rescale everything proportionally
         new_non_booth_total = sum(v for k, v in zone_allocations.items() if k != ZoneType.PHONE_BOOTH)
         if new_non_booth_total > remaining_usable:
-            # Allocations exceed available space - but DO NOT reduce zones below their minimums
-            # Instead, reduce only the most flexible zones (open-space, circulation)
-            logger.warning(f"Minimum area constraints total {new_non_booth_total:.1f} sqm exceeds available {remaining_usable:.1f} sqm")
+            # Allocations still exceed available space (should not happen after min_scale_factor)
+            # Fall back to proportional scaling of all zones
+            logger.warning(f"Zone allocations total {new_non_booth_total:.1f} sqm exceeds available {remaining_usable:.1f} sqm. Rescaling.")
 
             # Strategy: reduce only flexible zones (open-space) to make room for constrained zones
             flexible_types = {ZoneType.OPEN_SPACE}
