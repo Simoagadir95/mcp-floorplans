@@ -243,41 +243,6 @@ class SpaceCalculator:
                 remaining = [r for r in remaining if r[0] not in rectangles]
                 logger.debug(f"TREEMAP: laid out {old_remaining - len(remaining)} zones, remaining={len(remaining)}")
 
-    def _calculate_min_dimension_for_constraints(self, area: float, zone_type_str: str) -> float:
-        """
-        Calculate minimum required dimension for a zone to satisfy its constraints.
-        For a zone with given area and constraints, returns the minimum height/width needed
-        such that the zone can be oriented to satisfy both min_width and max_aspect_ratio.
-
-        Formula: min_dimension = max(min_width, sqrt(area / max_aspect_ratio))
-
-        This ensures that when a zone is placed in a row with height = min_dimension,
-        it can be dimensioned to satisfy: short_side >= min_width and aspect_ratio <= max_aspect.
-
-        Args:
-            area: Zone area in square meters
-            zone_type_str: Zone type string (e.g., "circulation")
-
-        Returns:
-            Minimum dimension required in meters (or 0 if no constraint defined)
-        """
-        try:
-            zone_type = ZoneType(zone_type_str)
-        except (ValueError, KeyError):
-            return 0.0
-
-        constraints = self.SHAPE_CONSTRAINTS.get(zone_type)
-        if not constraints:
-            return 0.0
-
-        min_width = constraints.get("min_width", 0)
-        max_aspect = constraints.get("max_aspect_ratio", float('inf'))
-
-        # Minimum dimension to satisfy constraints: max(min_width, sqrt(area / max_aspect))
-        if max_aspect > 0 and area > 0:
-            return max(min_width, math.sqrt(area / max_aspect))
-        return min_width
-
     def _layout_row_horizontal(self, areas: List[Tuple[str, float]],
                                x: float, y: float, width: float, height: float,
                                rectangles: Dict[str, Tuple[float, float, float, float]],
@@ -286,8 +251,6 @@ class SpaceCalculator:
         Layout a horizontal row of rectangles.
         Returns the row height used.
         Implements squarification: greedily add rectangles to row while aspect ratio improves.
-        CYCLE 30 FIX: Constraint-aware placement — zones are only added to a row if the row height
-        can accommodate their constraint requirements (min_dimension).
         DEFECT I-2/I-3/I-4 FIX: Preserve exact area for every zone by proportionally scaling widths.
         GUARANTEES: Σ(zone_width) = width (within floating-point precision)
                     Each zone.sqm = zone_width * zone_height (exact to 1e-6)
@@ -305,19 +268,6 @@ class SpaceCalculator:
             # Try adding this rectangle to the row
             test_row = row + [(name, area)]
             test_total = row_total_area + area
-
-            # CYCLE 30 FIX: Before adding zone, check if row height will satisfy its constraint requirements
-            test_row_height = test_total / width if width > 0 else 0
-            zone_type_str = zone_name_to_type.get(name) if zone_name_to_type else None
-            if zone_type_str:
-                min_dim = self._calculate_min_dimension_for_constraints(area, zone_type_str)
-                if test_row_height < min_dim - 1e-3:
-                    # Row height would be insufficient for this zone's constraints
-                    # Do not add it to this row; close the row and let zone be placed elsewhere
-                    logger.debug(
-                        f"  Skipped {name} (area={area:.2f}): row_height={test_row_height:.3f} < min_required={min_dim:.3f} for {zone_type_str}"
-                    )
-                    break
 
             # Calculate worst aspect ratio if we add this rectangle
             test_ratio = self._worst_aspect_ratio_for_row(test_row, width)
@@ -422,8 +372,6 @@ class SpaceCalculator:
         Layout a vertical row (column) of rectangles.
         Returns the row width used.
         Implements squarification: greedily add rectangles while aspect ratio improves.
-        CYCLE 30 FIX: Constraint-aware placement — zones are only added to a row if the row width
-        can accommodate their constraint requirements (min_dimension).
         DEFECT I-2/I-3/I-4 FIX: Preserve exact area for every zone by proportionally scaling heights.
         GUARANTEES: Σ(zone_height) = height (within floating-point precision)
                     Each zone.sqm = zone_width * zone_height (exact to 1e-6)
@@ -439,19 +387,6 @@ class SpaceCalculator:
             # Try adding this rectangle to the row
             test_row = row + [(name, area)]
             test_total = row_total_area + area
-
-            # CYCLE 30 FIX: Before adding zone, check if row width will satisfy its constraint requirements
-            test_row_width = test_total / height if height > 0 else 0
-            zone_type_str = zone_name_to_type.get(name) if zone_name_to_type else None
-            if zone_type_str:
-                min_dim = self._calculate_min_dimension_for_constraints(area, zone_type_str)
-                if test_row_width < min_dim - 1e-3:
-                    # Row width would be insufficient for this zone's constraints
-                    # Do not add it to this row; close the row and let zone be placed elsewhere
-                    logger.debug(
-                        f"  Skipped {name} (area={area:.2f}): row_width={test_row_width:.3f} < min_required={min_dim:.3f} for {zone_type_str}"
-                    )
-                    break
 
             # Calculate worst aspect ratio if we add this rectangle
             test_ratio = self._worst_aspect_ratio_for_row(test_row, height)
