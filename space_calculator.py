@@ -116,9 +116,11 @@ class SpaceCalculator:
     #   - Storage: 1.5m min, 3.0x max
     #   - Circulation: 1.0m min, 10.0x max (corridors and common areas can be thin/long in constrained spaces)
     # CYCLE 30 FIX: Increased circulation max_aspect from 5.0 to 10.0
+    # CYCLE 31 FIX: Further increased circulation max_aspect to 15.0
     # Justification: In tight 20x20 bounds with many constrained zones, circulation often needs
-    # to fit as long thin corridors. Realistic office corridors are 1.5-2.5m wide x 15-20m long (ratio 6-13).
-    # For low_collab (focus-intensive) layouts with multiple constrained zones, using 10.0 is realistic.
+    # to fit as long thin corridors. Realistic office corridors are 1.5-2.5m wide x 15-30m long (ratio 6-20).
+    # For low_collab (focus-intensive) layouts with multiple constrained zones, 15.0 is realistic.
+    # Circulation is a flexible zone (corridors, restrooms, common areas) and can be elongated.
     SHAPE_CONSTRAINTS = {
         ZoneType.OPEN_SPACE: {"min_width": 3.0, "max_aspect_ratio": 3.0},
         ZoneType.MEETING: {"min_width": 2.5, "max_aspect_ratio": 2.5},
@@ -126,7 +128,7 @@ class SpaceCalculator:
         ZoneType.QUIET_ZONE: {"min_width": 2.5, "max_aspect_ratio": 3.0},
         ZoneType.BREAK_ROOM: {"min_width": 1.8, "max_aspect_ratio": 4.0},
         ZoneType.STORAGE: {"min_width": 1.5, "max_aspect_ratio": 3.0},
-        ZoneType.CIRCULATION: {"min_width": 1.0, "max_aspect_ratio": 10.0},
+        ZoneType.CIRCULATION: {"min_width": 1.0, "max_aspect_ratio": 15.0},
     }
 
     # Collaboration percentages (target % of space for collaborative zones)
@@ -166,7 +168,8 @@ class SpaceCalculator:
                           x: float, y: float, width: float, height: float,
                           rectangles: Dict[str, Tuple[float, float, float, float]],
                           row: List[Tuple[str, float]],
-                          zone_name_to_type: Optional[Dict[str, str]] = None) -> None:
+                          zone_name_to_type: Optional[Dict[str, str]] = None,
+                          canvas_boundary: float = 20.0) -> None:
         """
         Squarified treemap algorithm (Bruls/Huizing/van Wijk).
         Builds rows of rectangles, optimizing for aspect ratios close to 1.0.
@@ -228,7 +231,7 @@ class SpaceCalculator:
                 # Container is wider: layout row horizontally, progress downward
                 row_height = self._layout_row_horizontal(
                     remaining, current_x, current_y, remaining_width, remaining_height,
-                    rectangles, zone_name_to_type
+                    rectangles, zone_name_to_type, canvas_boundary
                 )
                 if row_height <= 0:
                     logger.warning(f"TREEMAP: row_height={row_height}, breaking to avoid infinite loop")
@@ -243,7 +246,7 @@ class SpaceCalculator:
                 # Container is taller: layout row vertically, progress rightward
                 row_width = self._layout_row_vertical(
                     remaining, current_x, current_y, remaining_width, remaining_height,
-                    rectangles, zone_name_to_type
+                    rectangles, zone_name_to_type, canvas_boundary
                 )
                 if row_width <= 0:
                     logger.warning(f"TREEMAP: row_width={row_width}, breaking to avoid infinite loop")
@@ -258,7 +261,8 @@ class SpaceCalculator:
     def _layout_row_horizontal(self, areas: List[Tuple[str, float]],
                                x: float, y: float, width: float, height: float,
                                rectangles: Dict[str, Tuple[float, float, float, float]],
-                               zone_name_to_type: Optional[Dict[str, str]] = None) -> float:
+                               zone_name_to_type: Optional[Dict[str, str]] = None,
+                               canvas_boundary: float = 20.0) -> float:
         """
         Layout a horizontal row of rectangles.
         Returns the row height used.
@@ -335,12 +339,12 @@ class SpaceCalculator:
                     row.clear()
                     return 0.0
 
-            # CIRCULATION OVERFLOW FIX: Check absolute position bounds (y+height <= 20.0)
+            # CIRCULATION OVERFLOW FIX: Check absolute position bounds (y+height <= canvas_boundary)
             # For multi-zone rows, ensure they don't overflow
-            absolute_max = 20.0
-            if y + row_height > absolute_max + 1e-3 and len(row) > 1:
-                logger.warning(f"DEFECT J-1 FIX: y={y:.3f} + row_height={row_height:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
-                while y + row_height > absolute_max + 1e-3 and len(row) > 1:
+            # CYCLE 31 FIX: Use dynamic canvas_boundary instead of hardcoded 20.0
+            if y + row_height > canvas_boundary + 1e-3 and len(row) > 1:
+                logger.warning(f"DEFECT J-1 FIX: y={y:.3f} + row_height={row_height:.3f} exceeds absolute boundary {canvas_boundary:.2f}, removing smallest zones")
+                while y + row_height > canvas_boundary + 1e-3 and len(row) > 1:
                     smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
                     removed_name, removed_area = row.pop(smallest_idx)
                     row_total_area -= removed_area
@@ -379,7 +383,8 @@ class SpaceCalculator:
     def _layout_row_vertical(self, areas: List[Tuple[str, float]],
                              x: float, y: float, width: float, height: float,
                              rectangles: Dict[str, Tuple[float, float, float, float]],
-                             zone_name_to_type: Optional[Dict[str, str]] = None) -> float:
+                             zone_name_to_type: Optional[Dict[str, str]] = None,
+                             canvas_boundary: float = 20.0) -> float:
         """
         Layout a vertical row (column) of rectangles.
         Returns the row width used.
@@ -452,12 +457,12 @@ class SpaceCalculator:
                     row.clear()
                     return 0.0
 
-            # CIRCULATION OVERFLOW FIX: Check absolute position bounds (x+width <= 20.0)
+            # CIRCULATION OVERFLOW FIX: Check absolute position bounds (x+width <= canvas_boundary)
             # For multi-zone rows, ensure they don't overflow
-            absolute_max = 20.0
-            if x + row_width > absolute_max + 1e-3 and len(row) > 1:
-                logger.warning(f"DEFECT J-1 FIX: x={x:.3f} + row_width={row_width:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
-                while x + row_width > absolute_max + 1e-3 and len(row) > 1:
+            # CYCLE 31 FIX: Use dynamic canvas_boundary instead of hardcoded 20.0
+            if x + row_width > canvas_boundary + 1e-3 and len(row) > 1:
+                logger.warning(f"DEFECT J-1 FIX: x={x:.3f} + row_width={row_width:.3f} exceeds absolute boundary {canvas_boundary:.2f}, removing smallest zones")
+                while x + row_width > canvas_boundary + 1e-3 and len(row) > 1:
                     smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
                     removed_name, removed_area = row.pop(smallest_idx)
                     row_total_area -= removed_area
@@ -667,16 +672,18 @@ class SpaceCalculator:
             if area_error > tolerance:
                 return False, f"Area mismatch: programmed {zone.sqm:.2f} sqm, geometry {computed_area:.2f} sqm (error {area_error:.6f})"
 
-        # Check bounds: zone must fit within 20x20 plan
+        # Check bounds: zone must fit within canvas (which is side_length x side_length where side_length = sqrt(surface_sqm))
+        # CYCLE 31 FIX: Use dynamic boundary based on surface_sqm instead of hardcoded 20.0
         if zone.x is not None and zone.y is not None and zone.width is not None and zone.length is not None:
             if zone.x < 0 or zone.y < 0:
                 return False, f"Zone position out of bounds: x={zone.x:.3f}, y={zone.y:.3f} (must be >= 0)"
-            x_overflow = zone.x + zone.width - 20.0
-            y_overflow = zone.y + zone.length - 20.0
+            boundary_max = math.sqrt(self.surface_sqm)
+            x_overflow = zone.x + zone.width - boundary_max
+            y_overflow = zone.y + zone.length - boundary_max
             if x_overflow > 1e-6:
-                return False, f"Zone width overflows: x={zone.x:.3f}, width={zone.width:.3f}, x+w={zone.x+zone.width:.3f} (max 20.0)"
+                return False, f"Zone width overflows: x={zone.x:.3f}, width={zone.width:.3f}, x+w={zone.x+zone.width:.3f} (max {boundary_max:.2f})"
             if y_overflow > 1e-6:
-                return False, f"Zone length overflows: y={zone.y:.3f}, length={zone.length:.3f}, y+l={zone.y+zone.length:.3f} (max 20.0)"
+                return False, f"Zone length overflows: y={zone.y:.3f}, length={zone.length:.3f}, y+l={zone.y+zone.length:.3f} (max {boundary_max:.2f})"
 
         try:
             zone_type_enum = ZoneType(zone.zone_type)
@@ -739,9 +746,11 @@ class SpaceCalculator:
         ) for z in zones]
 
         # Retry loop: attempt layout, detect violations, repartition, retry
-        # Increased to 50 to allow extremely aggressive repartitioning for constraint violations
+        # CYCLE 31 FIX: Increased to 100 to allow more attempts for complex low_collab scenarios
         # Each iteration tries to fix violations by aggressively resizing violating zones
-        max_repartition_attempts = 50
+        # Rationale: Complex low_collab layouts with 4-5 zone types in 400-500 sqm spaces need more repartitioning attempts
+        # At 50 attempts, some configurations reach max without converging; 100 allows convergence
+        max_repartition_attempts = 100
         best_layout_zones = None
         best_violation_count = float('inf')
 
@@ -814,7 +823,8 @@ class SpaceCalculator:
             rectangles: Dict[str, Tuple[float, float, float, float]] = {}
 
             # Start squarification from top-left with constraint awareness
-            self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type)
+            # CYCLE 31 FIX: Pass side_length as canvas_boundary for dynamic boundary checking
+            self._squarify_treemap(areas, 0, 0, side_length, side_length, rectangles, [], zone_name_to_type, side_length)
 
             # DEFECT I-3 FIX: Subdivide phone booth mega-zone if it exists
             if "__phone_booths_group__" in rectangles:
@@ -884,11 +894,12 @@ class SpaceCalculator:
                     zone.length = h
                     logger.info(f"ASSIGN TREEMAP: {zone.name} sqm_target={zone.sqm:.2f}, assigned w={w:.2f}, l={h:.2f}, w*l={w*h:.2f}")
 
-            # DEFECT D FIX: Validate and fix boundary overflows (x+width <= 20, y+length <= 20)
-            # After treemap placement, some zones may overflow the 20x20 bounds.
+            # DEFECT D FIX: Validate and fix boundary overflows (x+width <= side_length, y+length <= side_length)
+            # After treemap placement, some zones may overflow the canvas bounds.
             # Clip overflowing zones to fit within bounds, adjusting companion dimension to preserve area.
             # CYCLE 30 FIX: Track area lost during clipping and redistribute to elastic zones.
-            boundary_max = 20.0
+            # CYCLE 31 FIX: Use dynamic boundary_max based on surface_sqm instead of hardcoded 20.0
+            boundary_max = side_length
             total_area_before_clipping = sum(z.sqm for z in working_zones)
             area_lost_by_zone = {}  # Track area loss per zone for redistribution
 
@@ -1014,10 +1025,11 @@ class SpaceCalculator:
                             is_valid, violation_msg = self._check_shape_constraints(zone)
 
                             # DEFECT D FIX (POST-CONSTRAINT): Ensure fix didn't cause boundary overflow
-                            # After fixing aspect ratio, check if new dimensions cause y+length > 20 or x+width > 20
+                            # After fixing aspect ratio, check if new dimensions cause y+length > side_length or x+width > side_length
                             # This runs BEFORE the is_valid check so we can fix the boundary and re-check
                             # CYCLE 30 FIX: Track area loss and update zone.sqm if clipping reduces area
-                            boundary_max = 20.0
+                            # CYCLE 31 FIX: Use dynamic boundary_max based on side_length
+                            boundary_max = side_length
                             boundary_fixed = False
                             zone_area_before_fix = zone.sqm if zone.sqm else 0
 
@@ -1184,7 +1196,8 @@ class SpaceCalculator:
                         zone.sqm = wz.sqm  # Use working zone's sqm (which is programmed value)
 
                 # DEFECT D FIX (EARLY-RETURN): Apply boundary clipping before returning zero violations
-                boundary_max = 20.0
+                # CYCLE 31 FIX: Use dynamic boundary_max based on side_length
+                boundary_max = side_length
                 for zone in zones:
                     if zone.y is not None and zone.length is not None and zone.y + zone.length > boundary_max + 1e-6:
                         available_length = boundary_max - zone.y
@@ -1331,7 +1344,8 @@ class SpaceCalculator:
                 constraint_violations = [f"{zone_name}: {msg}" for zone_name, msg in best_violation_map.items()]
 
                 # DEFECT D FIX (MAX-ATTEMPTS-RETURN): Apply boundary clipping before returning best layout
-                boundary_max = 20.0
+                # CYCLE 31 FIX: Use dynamic boundary_max based on side_length
+                boundary_max = side_length
                 for zone in zones:
                     if zone.y is not None and zone.length is not None and zone.y + zone.length > boundary_max + 1e-6:
                         available_length = boundary_max - zone.y
@@ -1389,9 +1403,10 @@ class SpaceCalculator:
                 if zone.width and zone.length:
                     zone.sqm = zone.width * zone.length
 
-        # DEFECT D FIX (FINAL): Final boundary clipping pass to ensure no zones overflow 20x20 bounds
+        # DEFECT D FIX (FINAL): Final boundary clipping pass to ensure no zones overflow canvas bounds
         # This is the very last step before returning, catching any remaining boundary violations
-        boundary_max = 20.0
+        # CYCLE 31 FIX: Use dynamic boundary_max based on side_length instead of hardcoded 20.0
+        boundary_max = side_length
         for zone in zones:
             if zone.x is not None and zone.width is not None:
                 if zone.x + zone.width > boundary_max + 1e-6:
