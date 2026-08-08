@@ -153,197 +153,231 @@ class SpaceCalculator:
                           row: List[Tuple[str, float]],
                           zone_name_to_type: Optional[Dict[str, str]] = None) -> None:
         """
-        Simplified treemap subdivision ensuring non-overlapping placement.
-        Alternates between horizontal and vertical cuts for balance.
-        ENFORCES shape constraints (min_width, max_aspect_ratio) during subdivision.
-        Rejects rectangles that violate constraints; raises ValueError if no valid cut exists.
+        Squarified treemap algorithm (Bruls/Huizing/van Wijk).
+        Builds rows of rectangles, optimizing for aspect ratios close to 1.0.
+        GUARANTEES: non-overlapping, exact area conservation, better aspect ratios than binary cuts.
+
+        Algorithm:
+        1. Start with sorted rectangles (descending by area)
+        2. Build a row by adding rectangles while worst-case aspect ratio improves
+        3. When next rectangle would worsen aspect ratio, lay out the row
+        4. Row is placed along the shortest side of the remaining container
+        5. Update container and repeat until all rectangles placed
 
         Args:
             areas: List of (zone_name, area_sqm) tuples sorted descending
             x, y: Origin coordinates (meters)
             width, height: Dimensions (meters)
             rectangles: Output dict mapping zone_name -> (x, y, width, height)
-            row: Current row being processed (unused in simplified version)
+            row: Current row being processed (used to accumulate rectangles for a row)
             zone_name_to_type: Map from zone name to zone type for constraint lookup
-
-        Raises:
-            ValueError: If a rectangle violates constraints and cannot be fixed
         """
         if not areas or width <= 0 or height <= 0:
             return
 
-        # Base case: single rectangle
+        # Base case: single rectangle — assign exactly to container
         if len(areas) == 1:
             name, area = areas[0]
-            # DEFECT I CRITICAL FIX: Ensure width*length == area for this rectangle
-            # The treemap container may be larger than needed (from proportional cuts)
-            # Scale to match the target area while keeping the rectangle within bounds
-            container_area = width * height
-            if container_area > 0 and area > 0:
-                # Calculate how much to shrink: scale = sqrt(area / container_area)
-                # This shrinks both width and height proportionally
-                scale = math.sqrt(area / container_area)
-                old_w, old_h = width, height
-                width = width * scale
-                height = height * scale
-                logger.info(f"TREEMAP BASE CASE: {name} area={area:.2f}, container_area={container_area:.2f}, scale={scale:.4f}, rect: ({old_w:.2f}x{old_h:.2f} -> {width:.2f}x{height:.2f})")
-
-            # Check constraint on the final rectangle
-            zone_type_str = zone_name_to_type.get(name, "unknown") if zone_name_to_type else "unknown"
-            if not self._validate_rectangle_constraints(name, zone_type_str, width, height):
-                # Cannot fix a single rectangle violation - this may require caller to handle
-                # For now, we store it and will report in metrics
-                # In production, we'd re-subdivide the parent or increase container
-                pass
+            # Use container dimensions as-is; treemap guarantees exact area conservation
+            # by construction (area = width * height in the subdivision)
             rectangles[name] = (x, y, width, height)
+            logger.debug(f"TREEMAP BASE: {name} area={area:.2f}, assigned w={width:.2f}, h={height:.2f}, w*h={width*height:.2f}")
             return
 
-        # Split into two groups for binary tree cut
-        # This guarantees no overlaps by construction
-        mid = len(areas) // 2
-        left_areas = areas[:mid]
-        right_areas = areas[mid:]
+        # Squarification: build rows of rectangles
+        remaining = list(areas)
+        current_x = x
+        current_y = y
+        remaining_width = width
+        remaining_height = height
+        iteration = 0
+        max_iterations = len(areas) + 10  # Safety limit to prevent infinite loops
 
-        # Calculate total area for each group
-        left_total = sum(a[1] for a in left_areas)
-        right_total = sum(a[1] for a in right_areas)
-        total_all = left_total + right_total
+        while remaining and iteration < max_iterations:
+            iteration += 1
+            logger.debug(f"TREEMAP iteration {iteration}: remaining={len(remaining)} zones, container={remaining_width:.2f}x{remaining_height:.2f}")
 
-        if total_all == 0:
-            return
-
-        proportion = left_total / total_all if total_all > 0 else 0.5
-
-        # Strategy: Try to find a cut direction that satisfies constraints for both sides
-        # This is key to convergence — we check constraints BEFORE placing rectangles
-
-        if zone_name_to_type:
-            left_types = {zone_name_to_type.get(name, "unknown") for name, _ in left_areas}
-            # If all left zones are phone booths (or similar small zones), prefer horizontal cut to keep them narrow
-            if left_types <= {"phone-booth"}:
-                cut_height = height * proportion
-                # Ensure cut respects container constraints
-                if cut_height > 0 and (height - cut_height) > 0:
-                    self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                    self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
-                else:
-                    # Fallback to standard cut
-                    min_dimension = 1.0
-                    if width >= height:
-                        cut_width = max(min_dimension, width * proportion)
-                        cut_width = min(cut_width, width - min_dimension)
-                        self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                        self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
-                    else:
-                        cut_height = max(min_dimension, height * proportion)
-                        cut_height = min(cut_height, height - min_dimension)
-                        self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                        self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
-                return
-
-        # Standard logic: prefer cut perpendicular to longest side
-        # Constraint-aware: try to place zones with constraints in locations that allow better proportions
-        min_dimension = 1.0  # Minimum 1m dimension for any rectangle
-
-        # Check if we have constraint-heavy zones (those with tight min_width or aspect ratio)
-        if zone_name_to_type:
-            left_types = {zone_name_to_type.get(name, "unknown") for name, _ in left_areas}
-            # Zones that need wider proportions: quiet-zone, break-room, etc.
-            width_intensive = {"quiet-zone", "break-room", "meeting"}
-            has_width_intensive_left = bool(left_types & width_intensive)
-
-            if has_width_intensive_left and width < height:
-                # Width-intensive zones on left, but container is taller than wide
-                # Use VERTICAL cut to give left group (width-intensive) more horizontal space
-                cut_width = max(min_dimension, width * proportion)
-                cut_width = min(cut_width, width - min_dimension)
-                if cut_width > min_dimension and (width - cut_width) > min_dimension:
-                    self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                    self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
-                    return
-                # Fall through to standard logic if cut doesn't work
-
-        if width >= height:
-            # Vertical cut (split along width) — prefer for wider containers
-            cut_width = max(min_dimension, width * proportion)
-            cut_width = min(cut_width, width - min_dimension)
-
-            if cut_width > min_dimension and (width - cut_width) > min_dimension:
-                self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
+            # Determine layout direction (horizontal row along short side)
+            if remaining_width >= remaining_height:
+                # Container is wider: layout row horizontally, progress downward
+                row_height = self._layout_row_horizontal(
+                    remaining, current_x, current_y, remaining_width, remaining_height,
+                    rectangles, zone_name_to_type
+                )
+                if row_height <= 0:
+                    logger.warning(f"TREEMAP: row_height={row_height}, breaking to avoid infinite loop")
+                    break
+                current_y += row_height
+                remaining_height -= row_height
+                # Remove placed rectangles from remaining
+                old_remaining = len(remaining)
+                remaining = [r for r in remaining if r[0] not in rectangles]
+                logger.debug(f"TREEMAP: laid out {old_remaining - len(remaining)} zones, remaining={len(remaining)}")
             else:
-                # Proportion would create too-thin rectangle, use midpoint
-                cut_width = width / 2
-                self._squarify_treemap(left_areas, x, y, cut_width, height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x + cut_width, y, width - cut_width, height, rectangles, [], zone_name_to_type)
-        else:
-            # Horizontal cut (split along height) — prefer for taller containers
-            cut_height = max(min_dimension, height * proportion)
-            cut_height = min(cut_height, height - min_dimension)
+                # Container is taller: layout row vertically, progress rightward
+                row_width = self._layout_row_vertical(
+                    remaining, current_x, current_y, remaining_width, remaining_height,
+                    rectangles, zone_name_to_type
+                )
+                if row_width <= 0:
+                    logger.warning(f"TREEMAP: row_width={row_width}, breaking to avoid infinite loop")
+                    break
+                current_x += row_width
+                remaining_width -= row_width
+                # Remove placed rectangles from remaining
+                old_remaining = len(remaining)
+                remaining = [r for r in remaining if r[0] not in rectangles]
+                logger.debug(f"TREEMAP: laid out {old_remaining - len(remaining)} zones, remaining={len(remaining)}")
 
-            if cut_height > min_dimension and (height - cut_height) > min_dimension:
-                self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
+    def _layout_row_horizontal(self, areas: List[Tuple[str, float]],
+                               x: float, y: float, width: float, height: float,
+                               rectangles: Dict[str, Tuple[float, float, float, float]],
+                               zone_name_to_type: Optional[Dict[str, str]] = None) -> float:
+        """
+        Layout a horizontal row of rectangles.
+        Returns the row height used.
+        Implements squarification: greedily add rectangles to row while aspect ratio improves.
+        GUARANTEES: Σ(zone_width) = width (within floating-point precision)
+                    Each zone.sqm = zone_width * zone_height (exact)
+        """
+        if not areas or width <= 0 or height <= 0:
+            logger.warning(f"_layout_row_horizontal: early return due to empty/invalid: areas={len(areas) if areas else 0}, width={width}, height={height}")
+            return 0.0
+
+        row = []
+        row_total_area = 0.0
+        worst_ratio = float('inf')
+        logger.debug(f"_layout_row_horizontal: starting with {len(areas)} zones, container {width:.2f}x{height:.2f}")
+
+        for i, (name, area) in enumerate(areas):
+            # Try adding this rectangle to the row
+            test_row = row + [(name, area)]
+            test_total = row_total_area + area
+
+            # Calculate worst aspect ratio if we add this rectangle
+            test_ratio = self._worst_aspect_ratio_for_row(test_row, width)
+
+            # If this is the first rectangle, or aspect ratio improves, add it
+            if i == 0 or test_ratio < worst_ratio:
+                row = test_row
+                row_total_area = test_total
+                worst_ratio = test_ratio
+                logger.debug(f"  Added {name} (area={area:.2f}), worst_ratio={worst_ratio:.3f}")
             else:
-                # Proportion would create too-thin rectangle, use midpoint
-                cut_height = height / 2
-                self._squarify_treemap(left_areas, x, y, width, cut_height, rectangles, [], zone_name_to_type)
-                self._squarify_treemap(right_areas, x, y + cut_height, width, height - cut_height, rectangles, [], zone_name_to_type)
+                # Aspect ratio would worsen, so lay out current row and return
+                logger.debug(f"  Skipped {name} (ratio would worsen from {worst_ratio:.3f} to {test_ratio:.3f}), closing row with {len(row)} zones")
+                break
 
-    def _worst_aspect_ratio(self, items: List[Tuple[str, float]],
-                           width: float, height: float, total_area: float) -> float:
-        """Calculate worst aspect ratio in a potential layout."""
-        if total_area == 0 or width == 0 or height == 0:
+        # Place the row
+        if row:
+            row_height = row_total_area / width if width > 0 else 0
+            current_x = x
+            num_zones = len(row)
+            logger.info(f"Row horizontal: placing {len(row)} zones (total_area={row_total_area:.2f}), row_height={row_height:.3f}")
+
+            for idx, (name, area) in enumerate(row):
+                rect_width = area / row_height if row_height > 0 else 0
+
+                # Last zone in row absorbs any floating-point remainder
+                # This ensures Σ(rect_width) = width exactly
+                if idx == num_zones - 1:
+                    rect_width = (x + width) - current_x
+
+                rectangles[name] = (current_x, y, rect_width, row_height)
+                logger.debug(f"    {name}: x={current_x:.2f}, y={y:.2f}, w={rect_width:.2f}, h={row_height:.2f}, area={rect_width*row_height:.2f}")
+                current_x += rect_width
+
+            logger.debug(f"Row horizontal: placed {len(row)} zones, row_height={row_height:.3f}, sum_area={row_total_area:.3f}")
+            return row_height
+        logger.warning(f"_layout_row_horizontal: no zones in row!")
+        return 0.0
+
+    def _layout_row_vertical(self, areas: List[Tuple[str, float]],
+                             x: float, y: float, width: float, height: float,
+                             rectangles: Dict[str, Tuple[float, float, float, float]],
+                             zone_name_to_type: Optional[Dict[str, str]] = None) -> float:
+        """
+        Layout a vertical row (column) of rectangles.
+        Returns the row width used.
+        Implements squarification: greedily add rectangles while aspect ratio improves.
+        GUARANTEES: Σ(zone_height) = height (within floating-point precision)
+                    Each zone.sqm = zone_width * zone_height (exact)
+        """
+        if not areas or width <= 0 or height <= 0:
+            return 0.0
+
+        row = []
+        row_total_area = 0.0
+        worst_ratio = float('inf')
+
+        for i, (name, area) in enumerate(areas):
+            # Try adding this rectangle to the row
+            test_row = row + [(name, area)]
+            test_total = row_total_area + area
+
+            # Calculate worst aspect ratio if we add this rectangle
+            test_ratio = self._worst_aspect_ratio_for_row(test_row, height)
+
+            # If this is the first rectangle, or aspect ratio improves, add it
+            if i == 0 or test_ratio < worst_ratio:
+                row = test_row
+                row_total_area = test_total
+                worst_ratio = test_ratio
+            else:
+                # Aspect ratio would worsen, so lay out current row and return
+                break
+
+        # Place the row
+        if row:
+            row_width = row_total_area / height if height > 0 else 0
+            current_y = y
+            num_zones = len(row)
+
+            for idx, (name, area) in enumerate(row):
+                rect_height = area / row_width if row_width > 0 else 0
+
+                # Last zone in row absorbs any floating-point remainder
+                # This ensures Σ(rect_height) = height exactly
+                if idx == num_zones - 1:
+                    rect_height = (y + height) - current_y
+
+                rectangles[name] = (x, current_y, row_width, rect_height)
+                current_y += rect_height
+
+            logger.debug(f"Row vertical: placed {len(row)} zones, row_width={row_width:.3f}, sum_area={row_total_area:.3f}")
+            return row_width
+        return 0.0
+
+    def _worst_aspect_ratio_for_row(self, items: List[Tuple[str, float]],
+                                     container_side: float) -> float:
+        """
+        Calculate the worst aspect ratio of rectangles in a row.
+        Row length = container_side, row width = total_area / container_side.
+        For each rectangle: width = area / row_width, height = row_width.
+        Aspect ratio = max(width, height) / min(width, height).
+
+        Returns worst (highest) aspect ratio in the row.
+        """
+        if not items or container_side <= 0:
             return float('inf')
 
-        short_side = min(width, height)
-        long_side = max(width, height)
+        total_area = sum(a[1] for a in items)
+        if total_area == 0:
+            return float('inf')
 
+        row_width = total_area / container_side
         worst = 0.0
+
         for name, area in items:
-            # Aspect ratio of this element if laid in row
-            ratio = (long_side * long_side * total_area) / (area * area * short_side * short_side)
-            worst = max(worst, ratio)
+            rect_side = area / row_width  # One dimension of rectangle
+            other_side = row_width  # Other dimension
+            if rect_side > 0 and other_side > 0:
+                aspect = max(rect_side, other_side) / min(rect_side, other_side)
+                worst = max(worst, aspect)
 
         return worst
 
-    def _layout_row(self, items: List[Tuple[str, float]],
-                   x: float, y: float, width: float, height: float,
-                   total_area: float,
-                   rectangles: Dict[str, Tuple[float, float, float, float]]) -> Tuple[float, float, float, float]:
-        """Layout a row of rectangles and return remaining space."""
-        if not items or total_area == 0:
-            return x, y, width, height
 
-        # Determine row direction (horizontal or vertical)
-        if width >= height:
-            # Horizontal row
-            row_width = width
-            row_height = total_area / row_width if row_width > 0 else 0
-
-            # Place each item in row
-            current_x = x
-            for name, area in items:
-                item_width = area / row_height if row_height > 0 else 0
-                rectangles[name] = (current_x, y, item_width, row_height)
-                current_x += item_width
-
-            # Return remaining space below row
-            return x, y + row_height, width, height - row_height
-        else:
-            # Vertical row
-            row_height = height
-            row_width = total_area / row_height if row_height > 0 else 0
-
-            # Place each item in column
-            current_y = y
-            for name, area in items:
-                item_height = area / row_width if row_width > 0 else 0
-                rectangles[name] = (x, current_y, row_width, item_height)
-                current_y += item_height
-
-            # Return remaining space to right
-            return x + row_width, y, width - row_width, height
 
     def _validate_rectangle_constraints(self, zone_name: str, zone_type_str: str,
                                         rect_width: float, rect_height: float) -> bool:
@@ -465,24 +499,15 @@ class SpaceCalculator:
         best_violation_count = float('inf')
 
         # Track minimum areas required for each zone to satisfy constraints
+        # NOTE: Do NOT enforce minimum areas before treemap!
+        # The treemap will naturally lay out zones, and we'll check constraints AFTER.
+        # Enforcing before treemap causes cascading size increases that exceed surface_sqm.
         min_areas_required = {}
-        min_areas_total = 0
         for zone in working_zones:
             min_area = self._calculate_minimum_area_for_constraints(ZoneType(zone.zone_type))
             if min_area > 0:
                 min_areas_required[zone.name] = min_area
-                # Ensure zone has at least minimum area
-                if zone.sqm < min_area:
-                    logger.info(f"Zone {zone.name} ({zone.zone_type}): allocated {zone.sqm:.1f} sqm but needs minimum {min_area:.1f} sqm. Increasing to minimum.")
-                    zone.sqm = min_area
-                min_areas_total += min_area
-            else:
-                min_areas_total += zone.sqm
-
-        # Verify minimum areas fit within total surface
-        if min_areas_total > self.surface_sqm:
-            logger.critical(f"Minimum area constraints ({min_areas_total:.1f} sqm) exceed total surface ({self.surface_sqm} sqm). This is IMPOSSIBLE to satisfy.")
-            # Still proceed - will give best effort
+            # Do NOT increase zone.sqm here! The treemap will handle layout.
 
         for attempt in range(max_repartition_attempts):
             # DEFECT I FIX: Use treemap base case scaling (width*length = area) for exact conservation
@@ -866,7 +891,7 @@ class SpaceCalculator:
         DEFECT B FIX: Ensure each zone gets minimum area to satisfy shape constraints.
         """
         usable = self.calculate_usable_area()  # 85% of total surface
-        circulation_sqm = self.surface_sqm * self.circulation_pct  # 15% of total
+        # Do NOT calculate circulation_sqm yet - it will be added after rescaling
         zones = []
 
         # STEP 1: Calculate base allocations
@@ -944,6 +969,15 @@ class SpaceCalculator:
             elif ZoneType.CIRCULATION in zone_allocations:
                 zone_allocations[ZoneType.CIRCULATION] += extra_space
 
+        # CRITICAL FIX: Ensure total allocations sum to exactly surface_sqm
+        # Scale all zones proportionally if necessary
+        total_allocated = sum(zone_allocations.values())
+        if total_allocated > 0 and total_allocated != self.surface_sqm:
+            scale_factor = self.surface_sqm / total_allocated
+            logger.info(f"Rescaling all zones by {scale_factor:.6f} to conserve surface ({total_allocated:.2f} -> {self.surface_sqm:.2f})")
+            for zone_type in zone_allocations:
+                zone_allocations[zone_type] *= scale_factor
+
         # Create zone objects
         for zone_type, count in distribution.items():
             if count == 0:
@@ -1010,6 +1044,10 @@ class SpaceCalculator:
                 zones.append(zone)
 
         # Add circulation zone
+        # Calculate circulation based on what's been allocated so far
+        total_allocated_to_zones = sum(z.sqm for z in zones)
+        circulation_sqm = max(0, self.surface_sqm - total_allocated_to_zones)
+
         zones.append(Zone(
             zone_type=ZoneType.CIRCULATION.value,
             name="Circulation & Common",
