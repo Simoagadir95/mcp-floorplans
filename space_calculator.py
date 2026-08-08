@@ -872,6 +872,38 @@ class SpaceCalculator:
                     zone.length = h
                     logger.info(f"ASSIGN TREEMAP: {zone.name} sqm_target={zone.sqm:.2f}, assigned w={w:.2f}, l={h:.2f}, w*l={w*h:.2f}")
 
+            # DEFECT D FIX: Validate and fix boundary overflows (x+width <= 20, y+length <= 20)
+            # After treemap placement, some zones may overflow the 20x20 bounds.
+            # Clip overflowing zones to fit within bounds, adjusting companion dimension to preserve area.
+            boundary_max = 20.0
+            for zone in working_zones:
+                if zone.x is None or zone.y is None or zone.width is None or zone.length is None:
+                    continue
+
+                # Check width overflow (x+width > 20)
+                if zone.x + zone.width > boundary_max + 1e-6:
+                    available_width = boundary_max - zone.x
+                    if available_width > 0:
+                        new_length = zone.sqm / available_width if available_width > 0 else zone.length
+                        logger.warning(
+                            f"DEFECT D FIX: {zone.name} width overflow: x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
+                            f"Clipping: new_width={available_width:.3f}, new_length={new_length:.3f} (area={available_width * new_length:.2f})"
+                        )
+                        zone.width = available_width
+                        zone.length = new_length
+
+                # Check length overflow (y+length > 20)
+                if zone.y + zone.length > boundary_max + 1e-6:
+                    available_length = boundary_max - zone.y
+                    if available_length > 0:
+                        new_width = zone.sqm / available_length if available_length > 0 else zone.width
+                        logger.warning(
+                            f"DEFECT D FIX: {zone.name} length overflow: y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
+                            f"Clipping: new_length={available_length:.3f}, new_width={new_width:.3f} (area={new_width * available_length:.2f})"
+                        )
+                        zone.width = new_width
+                        zone.length = available_length
+
             # DEFECT I CRITICAL FIX: Do NOT scale dimensions after treemap
             # The treemap produces rectangles where width*length should equal the pre-scaled sqm value
             # Scaling dimensions after treemap breaks the invariant and causes overlaps
