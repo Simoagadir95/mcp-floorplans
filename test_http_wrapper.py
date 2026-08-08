@@ -7,7 +7,12 @@ Verifies:
   3. Negative test: reject token with invalid format
 """
 
+import os
 import pytest
+
+# Set development mode token for testing before importing app
+os.environ["DEVELOPMENT_MODE_TOKEN"] = "test_token_development_only_" + "x" * 50
+
 from fastapi.testclient import TestClient
 from http_wrapper import app
 
@@ -113,7 +118,8 @@ def test_valid_token_format_accepted():
     D3 Test: Request with valid Bearer token format is accepted.
     (This doesn't validate the token against an auth server, just format.)
     """
-    valid_token = "valid_token_" + "x" * 50  # Make it longer than 10 chars
+    # Use the development mode token set in environment
+    valid_token = os.environ.get("DEVELOPMENT_MODE_TOKEN", "test_token_development_only_" + "x" * 50)
 
     response = client.post(
         "/generate-layouts",
@@ -143,7 +149,8 @@ def test_valid_token_format_accepted():
 
 def test_get_layout_with_token():
     """D3 Test: GET layout endpoint requires and accepts Bearer token."""
-    valid_token = "valid_token_" + "y" * 50
+    # Use the development mode token set in environment
+    valid_token = os.environ.get("DEVELOPMENT_MODE_TOKEN", "test_token_development_only_" + "x" * 50)
 
     response = client.get(
         "/layouts/test-project-123",

@@ -54,17 +54,23 @@ PROTECTED_RESOURCE_METADATA = {
         OAUTH_ISSUER
     ] if OAUTH_ISSUER else ["https://auth.example.com"],
 
-    # RECOMMENDED: Human-readable documentation
-    "resource_documentation": "https://github.com/virtus-ai/mcp-floorplans/blob/main/README.md",
+    # RECOMMENDED: Human-readable documentation (RFC 9728 field name)
+    "resource_documentation_uri": "https://github.com/virtus-ai/mcp-floorplans/blob/main/README.md",
 
     # RECOMMENDED: Supported scopes
-    "scopes_supported": [
-        "space:read",
-        "space:write"
+    "resource_scopes": [
+        {"name": "space:read", "description": "Read access to space layouts"},
+        {"name": "space:write", "description": "Generate and write space layouts"}
     ],
 
     # RECOMMENDED: Supported bearer method (from RFC 6750)
-    "bearer_methods_supported": ["authz_header"],
+    "supported_auth_methods": ["Bearer"],
+
+    # OAuth server configuration (for client use)
+    "authorization_server": "https://auth.example.com",
+    "token_endpoint": "https://auth.example.com/oauth/token",
+    "authorization_endpoint": "https://auth.example.com/oauth/authorize",
+    "resource_audience": "urn:virtus:mcp-floorplans",
 }
 
 

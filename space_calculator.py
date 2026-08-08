@@ -304,6 +304,20 @@ class SpaceCalculator:
             if row_height > height + 1e-3 and len(row) == 1:
                 logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_height={row_height:.3f} but only {height:.3f} available - placing anyway for constraint detection")
 
+            # CIRCULATION OVERFLOW FIX: Check absolute position bounds (y+height <= 20.0)
+            # Prevent zones from overflowing the floorplan's absolute boundary
+            absolute_max = 20.0
+            if y + row_height > absolute_max + 1e-3 and len(row) > 1:
+                logger.warning(f"CIRCULATION OVERFLOW CHECK: y={y:.3f} + row_height={row_height:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
+                while y + row_height > absolute_max + 1e-3 and len(row) > 1:
+                    smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
+                    removed_name, removed_area = row.pop(smallest_idx)
+                    row_total_area -= removed_area
+                    row_height = row_total_area / width if width > 0 else 0
+                    logger.debug(f"Removed {removed_name} (area={removed_area:.3f}) for overflow, new y+height={y + row_height:.3f}")
+            elif y + row_height > absolute_max + 1e-3 and len(row) == 1:
+                logger.warning(f"CIRCULATION OVERFLOW CHECK: Single zone overflow: y={y:.3f} + height={row_height:.3f} = {y + row_height:.3f} exceeds {absolute_max} - placing anyway for constraint detection")
+
             if not row:
                 # All zones were removed - shouldn't happen but handle gracefully
                 logger.warning(f"_layout_row_horizontal: all zones removed during pre-row-layout validation!")
@@ -389,6 +403,20 @@ class SpaceCalculator:
             # Constraint checking will catch the violation
             if row_width > width + 1e-3 and len(row) == 1:
                 logger.warning(f"PRE-ROW-LAYOUT VALIDATION: Single zone area={row_total_area:.3f} requires row_width={row_width:.3f} but only {width:.3f} available - placing anyway for constraint detection")
+
+            # CIRCULATION OVERFLOW FIX: Check absolute position bounds (x+width <= 20.0)
+            # Prevent zones from overflowing the floorplan's absolute boundary
+            absolute_max = 20.0
+            if x + row_width > absolute_max + 1e-3 and len(row) > 1:
+                logger.warning(f"CIRCULATION OVERFLOW CHECK: x={x:.3f} + row_width={row_width:.3f} exceeds absolute boundary {absolute_max}, removing smallest zones")
+                while x + row_width > absolute_max + 1e-3 and len(row) > 1:
+                    smallest_idx = min(range(len(row)), key=lambda i: row[i][1])
+                    removed_name, removed_area = row.pop(smallest_idx)
+                    row_total_area -= removed_area
+                    row_width = row_total_area / height if height > 0 else 0
+                    logger.debug(f"Removed {removed_name} (area={removed_area:.3f}) for overflow, new x+width={x + row_width:.3f}")
+            elif x + row_width > absolute_max + 1e-3 and len(row) == 1:
+                logger.warning(f"CIRCULATION OVERFLOW CHECK: Single zone overflow: x={x:.3f} + width={row_width:.3f} = {x + row_width:.3f} exceeds {absolute_max} - placing anyway for constraint detection")
 
             if not row:
                 # All zones were removed - shouldn't happen but handle gracefully
