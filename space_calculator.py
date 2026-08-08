@@ -949,69 +949,52 @@ class SpaceCalculator:
                         if fixed:
                             # Re-check after fix
                             is_valid, violation_msg = self._check_shape_constraints(zone)
+
+                            # DEFECT D FIX (POST-CONSTRAINT): Ensure fix didn't cause boundary overflow
+                            # After fixing aspect ratio, check if new dimensions cause y+length > 20 or x+width > 20
+                            # This runs BEFORE the is_valid check so we can fix the boundary and re-check
+                            boundary_max = 20.0
+                            boundary_fixed = False
+                            if zone.y is not None and zone.length is not None:
+                                if zone.y + zone.length > boundary_max + 1e-6:
+                                    # Fix caused length overflow; need to clip it
+                                    available_length = boundary_max - zone.y
+                                    if available_length > 0 and zone.sqm is not None:
+                                        new_width = zone.sqm / available_length
+                                        logger.warning(
+                                            f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} length overflow after fix: "
+                                            f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
+                                            f"Clipping: new_length={available_length:.3f}, new_width={new_width:.3f}"
+                                        )
+                                        zone.length = available_length
+                                        zone.width = new_width
+                                        boundary_fixed = True
+
+                            if not boundary_fixed and zone.x is not None and zone.width is not None:
+                                if zone.x + zone.width > boundary_max + 1e-6:
+                                    # Width overflow; clip width
+                                    available_width = boundary_max - zone.x
+                                    if available_width > 0 and zone.sqm is not None:
+                                        new_length = zone.sqm / available_width
+                                        logger.warning(
+                                            f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} width overflow after fix: "
+                                            f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
+                                            f"Clipping: new_width={available_width:.3f}, new_length={new_length:.3f}"
+                                        )
+                                        zone.width = available_width
+                                        zone.length = new_length
+                                        boundary_fixed = True
+
+                            # Re-check constraint after boundary fix
+                            if boundary_fixed:
+                                is_valid, violation_msg = self._check_shape_constraints(zone)
+
                             if is_valid:
-                                # DEFECT D FIX (POST-CONSTRAINT): Ensure fix didn't cause boundary overflow
-                                # After fixing aspect ratio, check if new dimensions cause y+length > 20 or x+width > 20
-                                boundary_max = 20.0
-                                if zone.y is not None and zone.length is not None:
-                                    if zone.y + zone.length > boundary_max + 1e-6:
-                                        # Fix caused length overflow; need to clip it
-                                        available_length = boundary_max - zone.y
-                                        if available_length > 0 and zone.sqm is not None:
-                                            new_width = zone.sqm / available_length
-                                            logger.warning(
-                                                f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} length overflow after fix: "
-                                                f"y={zone.y:.3f}, l={zone.length:.3f}, y+l={zone.y + zone.length:.3f}. "
-                                                f"Clipping: new_length={available_length:.3f}, new_width={new_width:.3f}"
-                                            )
-                                            zone.length = available_length
-                                            zone.width = new_width
-                                            # Re-check constraint after boundary fix
-                                            is_valid, violation_msg = self._check_shape_constraints(zone)
-                                            if not is_valid:
-                                                # Boundary fix caused constraint violation; keep the original violation message
-                                                attempt_violation_map[zone.name] = violation_msg
-                                                logger.info(f"After boundary fix, still violates: {zone.name}: {violation_msg}")
-                                            else:
-                                                del attempt_violation_map[zone.name]
-                                                logger.info(f"Fixed constraint violation for {zone.name} with boundary clipping")
-                                        else:
-                                            # Can't clip further; keep original violation
-                                            attempt_violation_map[zone.name] = violation_msg
-                                    elif zone.x is not None and zone.width is not None:
-                                        if zone.x + zone.width > boundary_max + 1e-6:
-                                            # Width overflow; clip width
-                                            available_width = boundary_max - zone.x
-                                            if available_width > 0 and zone.sqm is not None:
-                                                new_length = zone.sqm / available_width
-                                                logger.warning(
-                                                    f"DEFECT D FIX (POST-CONSTRAINT): {zone.name} width overflow after fix: "
-                                                    f"x={zone.x:.3f}, w={zone.width:.3f}, x+w={zone.x + zone.width:.3f}. "
-                                                    f"Clipping: new_width={available_width:.3f}, new_length={new_length:.3f}"
-                                                )
-                                                zone.width = available_width
-                                                zone.length = new_length
-                                                # Re-check constraint after boundary fix
-                                                is_valid, violation_msg = self._check_shape_constraints(zone)
-                                                if not is_valid:
-                                                    attempt_violation_map[zone.name] = violation_msg
-                                                    logger.info(f"After boundary fix, still violates: {zone.name}: {violation_msg}")
-                                                else:
-                                                    del attempt_violation_map[zone.name]
-                                                    logger.info(f"Fixed constraint violation for {zone.name} with boundary clipping")
-                                            else:
-                                                attempt_violation_map[zone.name] = violation_msg
-                                        else:
-                                            # Successfully fixed — remove from violation map
-                                            del attempt_violation_map[zone.name]
-                                            logger.info(f"Fixed constraint violation for {zone.name} while preserving area")
-                                    else:
-                                        # Successfully fixed — remove from violation map
-                                        del attempt_violation_map[zone.name]
-                                        logger.info(f"Fixed constraint violation for {zone.name} while preserving area")
+                                # Successfully fixed — remove from violation map
+                                del attempt_violation_map[zone.name]
+                                if boundary_fixed:
+                                    logger.info(f"Fixed constraint violation for {zone.name} with boundary clipping")
                                 else:
-                                    # Successfully fixed — remove from violation map
-                                    del attempt_violation_map[zone.name]
                                     logger.info(f"Fixed constraint violation for {zone.name} while preserving area")
                             else:
                                 # Still violates after fix — update with new message
