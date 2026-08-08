@@ -195,25 +195,29 @@ def test_circulation_zone_constraint_report():
 
 
 def test_surface_conservation():
-    """Test that total layout surface matches input surface_sqm (within tolerance)."""
-    surface_sqm = 500.0
+    """Test that total layout surface matches input surface_sqm (within strict 0.01% tolerance)."""
+    surface_sqm = 400.0
     calc = SpaceCalculator(
         surface_sqm=surface_sqm,
-        headcount=50,
-        zone_types=["open-space", "meeting", "quiet-zone"],
+        headcount=40,
+        zone_types=["open-space", "meeting", "quiet-zone", "phone-booth", "break-room"],
         collaboration_style="medium_collab"
     )
 
-    variants = calc.generate_variants(num_variants=1)
-    variant = variants[0]
+    variants = calc.generate_variants(num_variants=3)
 
-    total_area = sum(z.sqm for z in variant.zones)
-    tolerance = surface_sqm * 0.02  # 2% tolerance
+    # STRICT TOLERANCE: ±0.01 sqm on 400 sqm (0.0025%)
+    tolerance = 0.01
 
-    assert abs(total_area - surface_sqm) <= tolerance, (
-        f"Total layout area {total_area:.2f} sqm "
-        f"deviates from {surface_sqm} sqm by more than {tolerance:.2f} sqm tolerance"
-    )
+    for variant_idx, variant in enumerate(variants):
+        total_area = sum(z.sqm for z in variant.zones)
+        print(f"Variant {variant_idx + 1}: total_area={total_area:.4f}, target={surface_sqm:.4f}, deviation={abs(total_area - surface_sqm):.6f}")
+
+        assert abs(total_area - surface_sqm) <= tolerance, (
+            f"Variant {variant_idx + 1}: Total layout area {total_area:.4f} sqm "
+            f"deviates from {surface_sqm} sqm by {abs(total_area - surface_sqm):.6f} sqm "
+            f"(tolerance: ±{tolerance})"
+        )
 
 
 def test_sqm_geometry_invariant():

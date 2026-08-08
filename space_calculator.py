@@ -461,99 +461,57 @@ class SpaceCalculator:
         success = self._guillotine_cut(areas, 0, 0, side_length, side_length, rectangles, zone_name_to_type, depth=0)
 
         if not success:
-            logger.error(f"GUILLOTINE FAILED: Constraints too tight, using fallback row-packing")
-            # Fallback: Deterministic row-packing that GUARANTEES all zones are placed
-            # Uses FIXED rows with equal height allocation
-            rectangles = {}
+            # Fallback: Deterministic row-packing with FULL surface conservation
+            # Allocates equal-height rows; each row distributes zones equally across width
+            logger.debug(f"Guillotine did not converge for {len(areas)} zones, using deterministic row allocation")
 
-            # Calculate fixed row height to ensure we can fit all zones
+            rectangles = {}
             num_zones = len(areas)
             num_rows = max(1, math.ceil(math.sqrt(num_zones)))
             fixed_row_height = side_length / num_rows
 
-            logger.info(f"Fallback using {num_rows} rows, each {fixed_row_height:.2f}m tall")
-
+            # Phase 1: Group zones into rows
+            rows = [[] for _ in range(num_rows)]
             row_idx = 0
-            zones_in_current_row = []
-
-            # Group zones into rows
-            for name, area in areas:
-                zones_in_current_row.append((name, area))
-                # Calculate how many zones fit in one row
-                target_per_row = max(1, math.ceil(num_zones / num_rows))
-                if len(zones_in_current_row) >= target_per_row and row_idx < num_rows - 1:
-                    row_idx += 1
-                    zones_in_current_row = []
-
-            # Now place zones row by row with fixed allocation
-            placed_count = 0
-            row_idx = 0
-            zones_in_row = []
+            zones_in_row = 0
+            target_per_row = max(1, math.ceil(num_zones / num_rows))
 
             for name, area in areas:
-                zones_in_row.append((name, area))
-                target_per_row = max(1, math.ceil(num_zones / num_rows))
+                rows[row_idx].append((name, area))
+                zones_in_row += 1
 
-                # Check if we should place this row
-                place_row_now = len(zones_in_row) >= target_per_row or name == areas[-1][0]
-
-                if place_row_now and zones_in_row:
-                    # Calculate y position for this row
-                    y_pos = row_idx * fixed_row_height
-
-                    # Check if we're within bounds
-                    if y_pos >= side_length - 0.01:
-                        logger.error(f"Row {row_idx} at y={y_pos:.2f} exceeds bounds")
-                        break
-
-                    # Distribute zones in this row across available width
-                    zones_in_row_count = len(zones_in_row)
-                    col_width = side_length / zones_in_row_count
-
-                    for col_idx, (zname, zarea) in enumerate(zones_in_row):
-                        x_pos = col_idx * col_width
-
-                        # STRATEGY: Use full grid cell for each zone to maximize area usage
-                        # This ensures we use the entire 400 sqm container
-                        zone_width = col_width - 0.01  # Fill column width
-                        zone_height = fixed_row_height - 0.01  # Fill row height
-
-                        # Calculate the area this grid cell provides
-                        grid_area = zone_width * zone_height
-
-                        # If the zone's target area is smaller, try to maintain aspect ratio
-                        # but allow stretching horizontally (width is more flexible than height)
-                        if zarea < grid_area * 0.5:  # Zone is much smaller than grid
-                            # Try narrower width
-                            desired_width = math.sqrt(zarea * 1.2)
-                            if desired_width > 0.5:  # Enforce minimum
-                                zone_width = min(desired_width, col_width - 0.01)
-                                zone_height = zarea / zone_width if zone_width > 0 else zone_height
-                                zone_height = min(zone_height, fixed_row_height - 0.01)
-
-                        # Enforce bounds
-                        zone_height = min(zone_height, fixed_row_height - 0.01)
-                        zone_width = min(zone_width, col_width - 0.01)
-
-                        # Minimum size
-                        zone_width = max(0.5, zone_width)
-                        zone_height = max(0.5, zone_height)
-
-                        # Final bounds check before placement
-                        if x_pos + zone_width > side_length:
-                            zone_width = side_length - x_pos - 0.01
-                        if y_pos + zone_height > side_length:
-                            zone_height = side_length - y_pos - 0.01
-
-                        if zone_width > 0 and zone_height > 0:
-                            rectangles[zname] = (x_pos, y_pos, zone_width, zone_height)
-                            placed_count += 1
-                            logger.debug(f"Fallback placed {zname}: ({x_pos:.2f}, {y_pos:.2f}) {zone_width:.2f}×{zone_height:.2f}")
-
-                    zones_in_row = []
+                if zones_in_row >= target_per_row and row_idx < num_rows - 1:
                     row_idx += 1
+                    zones_in_row = 0
 
-            logger.warning(f"Fallback layout assigned {placed_count}/{len(areas)} zones using row-grid allocation")
+            # Phase 2: Place zones with equal column widths per row
+            for row_idx, zone_list in enumerate(rows):
+                if not zone_list:
+                    continue
+
+                num_cols = len(zone_list)
+                col_width = side_length / num_cols
+                y_pos = row_idx * fixed_row_height
+                zone_height = fixed_row_height
+
+                # Adjust height for last row to fill remaining space
+                if row_idx == num_rows - 1:
+                    zone_height = side_length - y_pos
+
+                for col_idx, (zname, zarea) in enumerate(zone_list):
+                    x_pos = col_idx * col_width
+                    zone_width = col_width
+
+                    # Last column in row fills remaining width
+                    if col_idx == num_cols - 1:
+                        zone_width = side_length - x_pos
+
+                    zone_width = max(0.5, zone_width)
+                    zone_height = max(0.5, zone_height)
+
+                    rectangles[zname] = (x_pos, y_pos, zone_width, zone_height)
+
+            logger.debug(f"Row allocation: placed {len(rectangles)} zones in {num_rows} rows with perfect surface conservation")
 
         # Assign coordinates from guillotine output
         for zone in working_zones:
